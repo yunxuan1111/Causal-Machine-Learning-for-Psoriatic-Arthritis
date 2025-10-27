@@ -7,17 +7,6 @@ output:
     df_print: paged
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(
-  echo = TRUE,      
-  eval = FALSE,     
-  results = 'hide', 
-  warning = FALSE,  
-  message = FALSE,  
-  fig.show = 'hide' 
-)
-```
-
 ### Data Loading
 ```{r packages_loading}
 # Load packages

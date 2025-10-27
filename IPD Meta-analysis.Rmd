@@ -7,18 +7,6 @@ output:
     df_print: paged
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(
-  echo = TRUE,      
-  eval = FALSE,     
-  results = 'hide', 
-  warning = FALSE,  
-  message = FALSE,  
-  fig.show = 'hide' 
-)
-```
-
-
 ### Data Loading
 ```{r packages_loading}
 # Packages loading
@@ -360,7 +348,7 @@ funnel(meta_res, main="Standard Error",  xlab = "Treatment effect (MD)", legend=
 ```
 
 ### Save the result of one stage model for later use
-```{r, echo = TRUE}
+```{r save_one_stage}
 # Save the data since we will use it again in another rmd
 one_stage_vals <- list(
   ATE      = ate_ci_satt$Estimate,

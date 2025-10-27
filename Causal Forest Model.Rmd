@@ -5,17 +5,6 @@ date: "2025-10-25"
 output: pdf_document
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(
-  echo = TRUE,      
-  eval = FALSE,     
-  results = 'hide', 
-  warning = FALSE,  
-  message = FALSE,  
-  fig.show = 'hide' 
-)
-```
-
 ### package loading
 ```{r package}
 set.seed(2025)
@@ -604,11 +593,6 @@ ggplot(ssi_both, aes(x = depth, y = jaccard_ssi, color = method)) +
 
 
 
-
-
-
-
-
 #### CDT (maxdepth = 2, minbucket=50)
 ```{r}
 set.seed(2025)
@@ -670,7 +654,7 @@ est_ci_tbl
 ```
 
 
-### Stability Check Minbuckets (revise based on grf author's codes)
+### Stability Check Minbuckets (revise based on causalDT author's codes)
 ```{r}
 # 1) Stability function: supports externally provided boot_idx_list (fixed bootstrap indices)
 evaluate_subgroup_stability_revise <- function(estimator, fit, X, y, Z = NULL,
@@ -936,7 +920,7 @@ fit_cdt_once <- function(d, mb, B_boot = B_BOOT) {                     # CHANGED
 
 
 
-# 4) Grid search (remaining logic unchanged)
+# 4) Grid search
 depth_set <- c(2,3)
 mb_set    <- c(10, 20, 30, 40, 50, 60)
 
