@@ -1,0 +1,917 @@
+---
+title: "Data Harmonization"
+author: "YJ"
+date: "2025-10-24"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,      
+  eval = FALSE,     
+  results = 'hide', 
+  warning = FALSE,  
+  message = FALSE,  
+  fig.show = 'hide' 
+)
+```
+
+### Data Loading
+```{r packages_loading}
+# Load packages
+library(dplyr)      
+library(haven)      
+library(readxl)     
+library(readr) 
+library(lubridate)
+library(forcats)    
+library(table1)     
+library(naniar)
+library(VIM)
+library(ggplot2)
+library(binom)
+library(scales)
+```
+
+```{r data_loading}
+# Define data cleaning function
+# Convert tagged missing values (.a, .b, .c) to NA
+clean_missing_values <- function(data) {
+  data_clean <- data %>%
+    # handle STATA tagged NAs
+    mutate(across(everything(), haven::zap_missing)) %>%
+    # handle character and factor variables
+    mutate(
+      across(where(is.character), 
+             ~ ifelse(.x %in% c(".a", ".b", ".c"), NA_character_, .x)),
+      across(where(is.factor), 
+             ~ factor(na_if(as.character(.x), ".a")))
+    )
+  return(data_clean)
+}
+
+# Load and clean STAMP dataset
+# stamp_dta <- read_dta("D://Dissertation Dataset//STAMP.dta")
+# stamp <- stamp_dta %>% mutate(across(where(is.labelled), haven::zap_labels))
+# write_xlsx(stamp, "D://Dissertation Dataset//STAMP.xlsx")
+
+stamp <- read_excel("D://Dissertation Dataset//STAMP.xlsx")
+stamp <- clean_missing_values(stamp)
+
+# Load and clean COMPLETE study datasets
+complete_ae <- read_excel("D://Dissertation Dataset//COMPLETE data//Complete_ae_datasharing_smk_oxford.xls")
+complete_visit_lab <- read_excel("D://Dissertation Dataset//COMPLETE data//Complete_lab_datasharing_smk_oxford.xls")
+complete_visit_PE <- read_excel("D://Dissertation Dataset//COMPLETE data//Complete_Phys_exam_datasharing_smk_oxford.xls")
+complete_disease_activity <- read_excel("D://Dissertation Dataset//COMPLETE data//Complete_disease_activity_datasharing_smk_oxford.xls")
+complete_HAQ <- read_excel("D://Dissertation Dataset//COMPLETE data//Complete_HAQ_datasharing_smk_oxford.xls")
+complete_PSAID <- read_excel("D://Dissertation Dataset//COMPLETE data//Complete_PSAID_datasharing_smk_oxford.xls")
+complete_SF12 <- read_excel("D://Dissertation Dataset//COMPLETE data//Complete_SF12_datasharing_smk_oxford.xls")
+complete_baseline <- read_excel("D://Dissertation Dataset//COMPLETE data//Complete_baseline_datasharing_smk_oxford.xls")
+complete_caspar <- read_excel("D://Dissertation Dataset//COMPLETE data//Complete_caspar_datasharing_smk_oxford.xls")
+complete_comedication <- read_excel("D://Dissertation Dataset//COMPLETE data//Complete_comedication_datasharing_smk_oxford.xls")
+complete_medicationhist <- read_excel("D://Dissertation Dataset//COMPLETE data//Complete_medhist_datasharing_smk_oxford.xls")
+
+complete_baseline <- clean_missing_values(complete_baseline)
+complete_disease_activity <- clean_missing_values(complete_disease_activity)
+
+# Load and clean GOLMePsA dataset
+golmepsa <- read_csv("D://Dissertation Dataset//Oxford group data request 2025.csv")
+golmepsa <- clean_missing_values(golmepsa)
+
+# Load and clean SPEED dataset 
+speed <- read_excel("D://Dissertation Dataset//SPEED.xlsx")
+speed <- clean_missing_values(speed)
+```
+
+
+### Baseline Data Harmonization
+```{r data_harmonization}
+# 1. Harmonize STAMP dataset
+stamp_subset <- stamp %>%
+  mutate(
+    # 1. Convert education level to categorical: 0=Primary, 1=Secondary, 2=Tertiary
+    edu_level = case_when(
+      (6 + fa12) <= 12 ~ 0,    
+      (6 + fa12) <= 18 ~ 1,     
+      (6 + fa12) >= 19 ~ 2,    
+      TRUE ~ NA_real_
+    ),
+    # 2. Convert smoking to binary: 1=smoker, 0=non-smoker
+    smoking_bin = if_else(is.na(packyear), NA_real_, 
+                         if_else(packyear > 0, 1, 0)),
+    # 3. Convert ID to character type
+    ID = as.character(respondentid)
+  ) %>%
+  select(ID, age0, sex, gd060, pm86b, bmi0, edu_level, smoking_bin, 
+         poptjc0, popsjc0, pasdas0, pasi0, dapsa0, psaid0, haqstan0, lei0, dactcount0)
+
+
+# 2. Harmonize COMPLETE dataset 
+complete_subset <- complete_baseline %>%
+  mutate(
+    # 1. Sex: 0=Male, 1=Female
+    sex_bin = case_when(
+      sex == "male" ~ 0,
+      sex == "female" ~ 1,
+      TRUE ~ NA_real_
+    ),
+    # 2. Occupation: 0=No paid job, 1=Paid job
+    occupation_bin = case_when(
+      dem_werk_cat %in% c("no job", "retired", "student", "incapacitated") ~ 0,
+      !is.na(dem_werk_cat) ~ 1,
+      TRUE ~ NA_real_
+    ),
+    # 3. Smoking: 0=Non-smoker, 1=Smoker
+    smoking_bin = case_when(
+      dem_smoking == "yes" ~ 1,
+      dem_smoking == "no" ~ 0,
+      TRUE ~ NA_real_
+    ),
+    # 4. Education level: 0=Primary, 1=Secondary, 2=Tertiary
+    edu_level = case_when(
+      dem_education %in% c("basisschool", "none") ~ 0,
+      dem_education == "middelbare school" ~ 1,
+      dem_education %in% c("MBO", "WO", "HBO") ~ 2,
+      TRUE ~ NA_real_
+    ),
+    # 5. Disease duration in months
+    created_date = as.Date(base_date_stata, format = "%Y/%m/%d"),
+    symptom_date = as.Date(disease_symptomdat_PsA_stata, format = "%Y/%m/%d"),
+    disease_duration = time_length(interval(symptom_date, created_date), "month"),
+    disease_duration = if_else(disease_duration < 0, 0, disease_duration),
+    # 6. Convert ID to character type
+    ID = as.character(RecordId)
+  ) %>%
+  select(ID, age, sex_bin, occupation_bin, disease_duration, BMI, edu_level, smoking_bin, tjc_68, sjc_66, pasdas_stata, pasi, dapsa_stata, PSAID_total, haq_tot_castor, lei, dact)
+
+
+# 3. Harmonize GOLMePsA dataset
+golmepsa_subset <- golmepsa %>%
+  mutate(
+    # 1. Sex: 0=Male, 1=Female
+    sex_bin = case_when(
+      Female == "Male" ~ 0,
+      Female == "Female" ~ 1,
+      TRUE ~ NA_real_
+    ),
+    # 2. Smoking: 0=Never, 1=Previous/Current
+    smoking_bin = case_when(
+      Smoker == "Never" ~ 0,
+      Smoker %in% c("Previous", "Current") ~ 1,
+      TRUE ~ NA_real_
+    ),
+    # 3. Calculate DAPSA score
+    DAPSA = TJC68_BSL + SJC66_BSL + PainVAS_BSL/10 + DAVAS_BSL/10 + CRPResult_BSL/10,
+    # 4. Convert ID to character type
+    ID = as.character(DummyID)
+  ) %>%
+  select(ID, Age, sex_bin, JointSymptomDuration, BMI, smoking_bin, 
+         TJC68_BSL, SJC66_BSL, PASDAS_BSL, PASIScore_BSL, DAPSA, HAQ_BSL, 
+         ExaminationEnthesitisTotal_BSL, DactCount_BSL)
+
+
+# 4. Harmonize SPEED dataset 
+speed_subset <- speed %>%
+  mutate(
+    # 1. Occupation: 0=No paid job, 1=Paid job
+    occupation_bin = case_when(
+      Occupation %in% c("non-manual", "light-manual", "heavy-manual") ~ 1,
+      Occupation == "not in work" ~ 0,
+      TRUE ~ NA_real_
+    ),
+    # 2. Education: 1=Secondary, 2=Tertiary
+    edu_level = case_when(
+      Education %in% c("gcse", "college", "a level") ~ 1,
+      Education == "university" ~ 2,
+      TRUE ~ NA_real_
+    ),
+    # 3. Smoking: 0=Never, 1=Previous/Current
+    smoking_bin = case_when(
+      Smoker %in% c("Ex", "Current") ~ 1,
+      Smoker == "Never" ~ 0,
+      TRUE ~ NA_real_
+    ),
+    # 4. Sex: 0=Male, 1=Female
+    sex_bin = case_when(
+      Sex == "Male" ~ 0,
+      Sex == "Female" ~ 1,
+      TRUE ~ NA_real_
+    ),
+    # 5. Disease duration in months
+    created_date = as.Date(created_at, format = "%m/%d/%Y %I:%M:%S %p"),
+    doiasym_date = as.Date(doiasym_BL, format = "%m/%d/%Y"),
+    disease_duration = time_length(interval(doiasym_date, created_date), "month"),
+    disease_duration = if_else(disease_duration < 0, 0, disease_duration),
+    # 6. Convert ID to character type
+    ID = as.character(id)
+  ) %>%
+  select(ID, Age, sex_bin, occupation_bin, disease_duration, BMI, edu_level, smoking_bin, TJC_BL, SJC_BL, PASDAS_BL, PASI_BL, DAPSA_BL, Psaid_BL, HAQ_BL, LEI_score_BL, Dactylitis_Total_BL)
+
+
+# Standardize variable names across datasets 
+standard_names <- c("ID", "age", "sex_bin", "occupation_bin", "disease_duration",
+                    "BMI", "education_level", "smoking_bin", "tender_joint_count", 
+                    "swollen_joint_count", "PASDAS", "PASI", "DAPSA", "PSAID", 
+                    "HAQ", "enthesitis", "dactylitis")
+
+golmepsa_names <- c("ID", "age", "sex_bin", "disease_duration", "BMI", "smoking_bin", 
+                    "tender_joint_count", "swollen_joint_count", "PASDAS", "PASI", 
+                    "DAPSA", "HAQ", "enthesitis", "dactylitis")
+
+# Apply standardized names
+names(stamp_subset) <- standard_names
+names(complete_subset) <- standard_names  
+names(speed_subset) <- standard_names
+names(golmepsa_subset) <- golmepsa_names
+
+
+# Adjust four subsets before combination
+stamp_subset_renamed <- stamp_subset %>%
+  mutate(trial = "STAMP") %>%
+  mutate(
+    sex_bin = factor(sex_bin, labels = c("Male", "Female")),
+    occupation_bin = factor(occupation_bin, labels = c("No Paid Job", "Paid Job")),
+    education_level = factor(education_level, labels = c("Primary", "Secondary", "Tertiary")),
+    smoking_bin = factor(smoking_bin, labels = c("No", "Yes"))
+  )
+
+complete_subset_renamed <- complete_subset %>%
+  mutate(trial = "COMPLETE") %>%
+  mutate(
+    sex_bin = factor(sex_bin, labels = c("Male", "Female")),
+    occupation_bin = factor(occupation_bin, labels = c("No Paid Job", "Paid Job")),
+    education_level = factor(education_level, labels = c("Primary", "Secondary", "Tertiary")),
+    smoking_bin = factor(smoking_bin, labels = c("No", "Yes"))
+  )
+
+golmepsa_subset_renamed <- golmepsa_subset %>%
+  mutate(trial = "GOLMePsA") %>%
+  mutate(
+    sex_bin = factor(sex_bin, labels = c("Male", "Female")),
+    smoking_bin = factor(smoking_bin, labels = c("No", "Yes"))
+  )
+
+speed_subset_renamed <- speed_subset %>%
+  mutate(trial = "SPEED") %>%
+  mutate(
+    sex_bin = factor(sex_bin, labels = c("Male", "Female")),
+    occupation_bin = factor(occupation_bin, labels = c("No Paid Job", "Paid Job")),
+    education_level = factor(education_level, labels = c("Secondary", "Tertiary")),
+    smoking_bin = factor(smoking_bin, labels = c("No", "Yes"))
+  )
+
+
+# Combine all datasets for baseline table
+combined_data <- bind_rows(stamp_subset_renamed, complete_subset_renamed, 
+                          golmepsa_subset_renamed, speed_subset_renamed)
+```
+
+
+### Generate baseline characteristics table
+```{r baseline_table}
+# Set variable labels for table
+label(combined_data$sex_bin) <- "Sex"
+label(combined_data$age) <- "Age"
+label(combined_data$occupation_bin) <- "Occupation"
+label(combined_data$disease_duration) <- "Disease Duration"
+label(combined_data$education_level) <- "Education Level"
+label(combined_data$smoking_bin) <- "Smoking"
+label(combined_data$tender_joint_count) <- "Tender Joint Count (68)"
+label(combined_data$swollen_joint_count) <- "Swollen Joint Count (66)"
+label(combined_data$enthesitis) <- "Enthesitis"
+label(combined_data$dactylitis) <- "Dactylitis"
+
+# Set measurement units
+units(combined_data$age) <- "years"
+units(combined_data$BMI) <- "kg/m²"
+
+# Create baseline characteristics table
+table1(~ age + sex_bin + occupation_bin + disease_duration + BMI +
+         education_level + smoking_bin + tender_joint_count + swollen_joint_count +
+         PASDAS + PASI + DAPSA + PSAID + HAQ + enthesitis + dactylitis | trial,
+       data = combined_data)
+```
+
+
+### Make a dataset with primary outcomes
+```{r dataset_primary_outcome}
+stamp <- stamp %>%
+  rename(ID = respondentid) %>%
+  mutate(ID = as.character(ID))
+
+golmepsa <- golmepsa %>%
+  rename(ID = DummyID) %>%
+  mutate(ID = as.character(ID),
+         ACR20_WK24 = if_else(ACR20_WK24 == "No", 0,
+                     if_else(ACR20_WK24 == "Yes", 1, NA)),
+         ACR50_WK24 = if_else(ACR50_WK24 == "No", 0,
+                     if_else(ACR50_WK24 == "Yes", 1, NA)),
+         ACR70_WK24 = if_else(ACR70_WK24 == "No", 0,
+                     if_else(ACR70_WK24 == "Yes", 1, NA)))
+speed <- speed %>%
+  rename(ID = id) %>%
+  mutate(ID = as.character(ID),
+         ACR20 = if_else(ACR20 == "No", 0,
+                     if_else(ACR20 == "Yes", 1, NA)),
+         ACR50 = if_else(ACR50 == "No", 0,
+                     if_else(ACR50 == "Yes", 1, NA)),
+         ACR70 = if_else(ACR70 == "No", 0,
+                     if_else(ACR70 == "Yes", 1, NA)))
+
+complete_disease_activity <- complete_disease_activity %>%
+  rename(ID = RecordId) %>%
+  mutate(ID = as.character(ID))
+         
+         
+# 1. Make STAMP dataset with primary outcomes
+stamp_po <- stamp_subset %>%
+  # Join baseline data with primary outcome measures at 6 months
+  left_join(
+    stamp %>% select(ID, RBASA0, 
+                     pasdas6, dapsa6, pasi6, haqstan6, lei6, dactcount6, 
+                     psaid6, acr20_response6, acr50_response6, acr70_response6, 
+                     popsjc6),
+    by = "ID"
+  ) %>%
+  mutate(trial = "STAMP") %>%
+  # Adjust treatment variable: 0=standard care, 2=early biologic treatment
+  mutate(RBASA0 = case_when(
+    RBASA0 == 0 ~ 0,    
+    RBASA0 == 1 ~ 2,    
+    TRUE ~ NA_real_
+  ))
+
+# Apply standardized names to STAMP dataset
+rename_stamp <- c("ID", "age", "sex_bin", "occupation_bin", "disease_duration",
+                  "BMI", "education_level", "smoking_bin", "tjc_bsl", "sjc_bsl", 
+                  "pasdas_bsl", "pasi_bsl", "dapsa_bsl", "psaid_bsl", "haq_bsl", 
+                  "enthesitis_bsl", "dactylitis_bsl", "treatment", 
+                  "pasdas_po", "dapsa_po", "pasi_po", "haq_po", "enthesitis_po", 
+                  "dactylitis_po", "psaid_po", "acr20_po", "acr50_po", "acr70_po", 
+                  "sjc_po", "trial")
+
+names(stamp_po) <- rename_stamp
+
+
+# 2. Make GOLMePsA dataset with primary outcomes
+golmepsa_po <- golmepsa_subset %>%
+  # Join baseline data with primary outcome measures at week 24
+  left_join(
+    golmepsa %>% 
+      mutate(
+        dapsa_wk24 = TJC68_WK24 + SJC66_WK24 + PainVAS_WK24/10 + 
+                     DAVAS_WK24/10 + CRPResult_WK24/10
+      ) %>%
+      select(ID, Allocation, PASDAS_WK24, dapsa_wk24, PASIScore_WK24, 
+             HAQ_WK24, ExaminationEnthesitisTotal_WK24, DactCount_WK24, 
+             ACR20_WK24, ACR50_WK24, ACR70_WK24, SJC66_WK24),
+    by = "ID"
+  ) %>%
+  # Adjust treatment variable: 0=standard care, 2=early biologic treatment
+  mutate(
+    Allocation = case_when(
+      Allocation == "GOLMTX" ~ 2,   
+      Allocation == "PBOMTX" ~ 0,   
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  mutate(trial = "GOLMePsA")
+
+# Apply standardized names to GOLMePsA dataset
+rename_golmepsa <- c("ID", "age", "sex_bin", "disease_duration", "BMI", 
+                     "smoking_bin", "tjc_bsl", "sjc_bsl", "pasdas_bsl", 
+                     "pasi_bsl", "dapsa_bsl", "haq_bsl", "enthesitis_bsl", 
+                     "dactylitis_bsl", "treatment", "pasdas_po", "dapsa_po", 
+                     "pasi_po", "haq_po", "enthesitis_po", "dactylitis_po", 
+                     "acr20_po", "acr50_po", "acr70_po", "sjc_po", "trial")
+
+names(golmepsa_po) <- rename_golmepsa
+
+
+# 3. Make SPEED dataset with primary outcomes
+speed_po <- speed_subset %>%
+  # Join baseline data with primary outcome measures at week 24
+  left_join(
+    speed %>% select(ID, trt_sp, PASDAS_24WK, DAPSA_24WK, pasi_24WK, 
+                     HAQ_24WK, LEI_score_24WK, Dactylitis_Total_24WK, 
+                     Psaid_24WK, ACR20, ACR50, ACR70, SJC_24WK),
+    by = "ID"
+  ) %>%
+  # Adjust treatment variable: 0=standard care, 1=combination csDMARDs, 2=early biologic treatment
+  mutate(
+    trt_sp = case_when(
+      trt_sp == "DMARD" ~ 1,
+      trt_sp == "TNF" ~ 2,
+      trt_sp == "Standard care" ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  mutate(trial = "SPEED")
+
+# Apply standardized names to SPEED dataset
+rename_speed <- c("ID", "age", "sex_bin", "occupation_bin", "disease_duration",
+                  "BMI", "education_level", "smoking_bin", "tjc_bsl", "sjc_bsl", 
+                  "pasdas_bsl", "pasi_bsl", "dapsa_bsl", "psaid_bsl", "haq_bsl", 
+                  "enthesitis_bsl", "dactylitis_bsl", "treatment",  
+                  "pasdas_po", "dapsa_po", "pasi_po", "haq_po", "enthesitis_po", 
+                  "dactylitis_po", "psaid_po", "acr20_po", "acr50_po", "acr70_po", 
+                  "sjc_po", "trial")
+
+names(speed_po) <- rename_speed
+
+
+# 4. Make COMPLETE dataset with primary outcomes
+complete_po <- complete_subset %>%
+  # Join baseline data with primary outcome measures at week 16
+  left_join(
+    complete_disease_activity %>% 
+      select(ID, trialmedication, pasdas_stata5, dapsa_stata5, pasi5, 
+             haq_tot_castor5, lei5, dact5, PSAID_total5, 
+             acr20_total_achieved_wk16, acr50_total_achieved_wk16, 
+             acr70_total_achieved_wk16, sjc_665),
+    by = "ID"
+  ) %>%
+  mutate(trial = "COMPLETE") %>%
+  # Adjust treatment variable: 0=standard care, 1=combination csDMARDs
+  mutate(
+    trialmedication = case_when(
+      trialmedication == 1 ~ 0,   
+      trialmedication == 0 ~ 1,   
+      TRUE ~ NA_real_
+    )
+  )
+
+# Apply standardized names to COMPLETE dataset
+rename_complete <- c("ID", "age", "sex_bin", "occupation_bin", "disease_duration",
+                     "BMI", "education_level", "smoking_bin", "tjc_bsl", "sjc_bsl", 
+                     "pasdas_bsl", "pasi_bsl", "dapsa_bsl", "psaid_bsl", "haq_bsl",  
+                     "enthesitis_bsl", "dactylitis_bsl", "treatment", 
+                     "pasdas_po", "dapsa_po", "pasi_po", "haq_po", "enthesitis_po", 
+                     "dactylitis_po", "psaid_po", "acr20_po", "acr50_po", "acr70_po", 
+                     "sjc_po", "trial")
+
+names(complete_po) <- rename_complete
+
+
+# Combine all datasets for three treatment groups analysis
+combined_po_3trt <- bind_rows(stamp_po, complete_po, golmepsa_po, speed_po)
+
+# Create dataset for two treatment groups (combine combination csDMARDs with early biologic treatment)
+combined_po_2trt <- combined_po_3trt %>%
+  mutate(
+    treatment = if_else(treatment == 2, 1, treatment)  
+  )
+```
+
+
+### Adjust primary outcome dataset and make a baseline table stratified by trial and treatment
+```{r baseline_table_by_treatment}
+# Convert variables to factor format
+data_factor_2trt <- combined_po_2trt %>%
+  mutate(
+    treatment = factor(treatment, levels = c(0, 1), 
+                       labels = c("Standard", "Intensive")),
+    trial = factor(trial),
+    sex_bin = factor(sex_bin, labels = c("Male", "Female")),
+    occupation_bin = factor(occupation_bin, 
+                           labels = c("No Paid Job", "Paid Job")),
+    education_level = factor(education_level, 
+                            labels = c("Primary", "Secondary", "Tertiary")),
+    smoking_bin = factor(smoking_bin, labels = c("No", "Yes")),
+    acr20_po = factor(acr20_po, levels = c(0, 1), labels = c("No", "Yes")),
+    acr50_po = factor(acr50_po, levels = c(0, 1), labels = c("No", "Yes")),
+    acr70_po = factor(acr70_po, levels = c(0, 1), labels = c("No", "Yes"))
+  )
+
+
+# Generate baseline table stratified by trial and treatment
+label(data_factor_2trt$sex_bin) <- "Sex"
+label(data_factor_2trt$age) <- "Age"
+label(data_factor_2trt$occupation_bin) <- "Occupation"
+label(data_factor_2trt$disease_duration) <- "Disease Duration"
+label(data_factor_2trt$education_level) <- "Education Level"
+label(data_factor_2trt$smoking_bin) <- "Smoking"
+label(data_factor_2trt$tjc_bsl) <- "Tender Joint Count (68)"
+label(data_factor_2trt$sjc_bsl) <- "Swollen Joint Count (66)"
+label(data_factor_2trt$enthesitis_bsl) <- "Enthesitis"
+label(data_factor_2trt$dactylitis_bsl) <- "Dactylitis"
+units(data_factor_2trt$age) <- "years"
+units(data_factor_2trt$BMI) <- "kg/m²"
+
+table1(
+  ~ age + sex_bin + occupation_bin + disease_duration + BMI +
+    education_level + smoking_bin + tjc_bsl + sjc_bsl +
+    pasdas_bsl + pasi_bsl + dapsa_bsl + psaid_bsl + haq_bsl + 
+    enthesitis_bsl + dactylitis_bsl | trial * treatment,  
+  data = data_factor_2trt,
+  overall = FALSE  # Remove overall column to focus on trial-treatment groups
+)
+```
+
+### Save the dataset for later analysis
+```{r data_saving}
+# Remove TJC since we didn't use it in the later analysis
+data_factor_2trt <- data_factor_2trt %>%
+  select(-tjc_bsl)
+
+# Save the dataset
+saveRDS(data_factor_2trt, file = "D://Dissertation Dataset//data_factor_2trt.rds")
+```
+
+
+
+### Exploratory Data Analysis
+#### 1. Check missing data
+```{r missing_data}
+vis_miss(data_factor_2trt)
+```
+
+
+#### 2. t-tests for continuous outcomes and chi-square tests for binary outcomes with plots of Y by treatment groups
+```{r t_tests_and_chi_square_tests}
+# 1. t-tests for continuous outcomes
+cts_outcome <- function(data, outcome_var, baseline_var, 
+                                      treatment_var = "treatment", 
+                                      outcome_label = outcome_var) {
+  
+  # Create complete cases dataset
+#  complete_data <- subset(data, complete.cases(data[[baseline_var]], 
+#                                              data[[outcome_var]], 
+#                                              data[[treatment_var]]))
+  complete_data <- data # t-tests and chi-square tests can deal with missing data
+  # Calculate group statistics (standard vs intensive)
+  group_stats <- complete_data %>%
+    group_by(!!sym(treatment_var)) %>%
+    summarise(
+      n = n(),
+      mean_outcome = mean(!!sym(outcome_var), na.rm = TRUE),
+      sd_outcome = sd(!!sym(outcome_var), na.rm = TRUE)
+    )
+  
+  # Perform t-test
+  t_test_formula <- as.formula(paste(outcome_var, "~", treatment_var))
+  t_test_result <- t.test(t_test_formula, data = complete_data)
+  
+  # Create visualization
+  p <- ggplot(data, aes_string(x = treatment_var, y = outcome_var)) +
+    geom_boxplot(position = position_dodge(width = 0.8), outlier.alpha = 0.3) +
+    geom_jitter(aes_string(color = treatment_var),
+                position = position_jitterdodge(jitter.width = 0.15, 
+                                               dodge.width = 0.8),
+                alpha = 0.25, size = 1) +
+    labs(x = "Treatment", y = outcome_label, 
+         color = "Treatment", 
+         title = paste(outcome_label, "by Treatment Groups")) +
+    theme_minimal()
+  
+  return(list(complete_data = complete_data, 
+              group_stats = group_stats, 
+              t_test = t_test_result,
+              plot = p))
+}
+
+
+# 2. chi-square tests + Wilson CI for binary outcomes (ACR responses)
+bin_outcome <- function(data, outcome_var, treatment_var = "treatment",
+                                  outcome_label = outcome_var) {
+  
+  # Create complete cases dataset
+  complete_data <- subset(data, complete.cases(data[[outcome_var]], 
+                                              data[[treatment_var]]))
+  
+  tab <- table(data[[treatment_var]], data[[outcome_var]])
+  
+  # Chi-square test
+  chi_test <- chisq.test(tab)
+  
+  # Calculate confidence intervals for each group
+  standard_group <- tab["Standard", ]
+  intensive_group <- tab["Intensive", ]
+  
+  standard_ci <- binom.confint(standard_group["Yes"], sum(standard_group), 
+                              methods = "wilson")
+  intensive_ci <- binom.confint(intensive_group["Yes"], sum(intensive_group), 
+                               methods = "wilson")
+  
+  prop_test <- prop.test(tab)
+  
+  # Create visualization
+  plot_df <- data %>%
+    mutate(
+      outcome_cat = case_when(
+        !!sym(outcome_var) %in% c(1, "Yes", "YES", "yes") ~ "Yes",
+        !!sym(outcome_var) %in% c(0, "No", "NO", "no") ~ "No",
+        TRUE ~ NA_character_
+      ),
+      outcome_cat = fct_explicit_na(factor(outcome_cat, levels = c("No", "Yes")),
+                                   na_level = "NA")
+    )
+  
+  prop <- plot_df %>%
+    count(!!sym(treatment_var), outcome_cat) %>%
+    group_by(!!sym(treatment_var)) %>%
+    mutate(p = n / sum(n))
+  
+  p <- ggplot(prop, aes_string(treatment_var, "p", fill = "outcome_cat")) +
+    geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+    geom_text(aes(label = percent(p, accuracy = 1)),
+              position = position_dodge(width = 0.7),
+              vjust = -0.3, size = 3) +
+    scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+    labs(x = "Treatment", y = "Proportion",
+         fill = outcome_label, 
+         title = paste(outcome_label, "Proportions by Treatment")) +
+    theme_minimal()
+  
+  return(list(complete_data = complete_data, 
+              contingency_table = tab, 
+              chi_test = chi_test,
+              proportion_test = prop_test,
+              confidence_intervals = list(standard = standard_ci, intensive = intensive_ci),
+              plot = p))
+}
+```
+
+
+```{r baseline_filter}
+# Make adjustments for outcomes that need baseline filtering when plotting
+baseline_filter <- function(data, outcome_var, baseline_var,
+                                                treatment_var = "treatment",
+                                                outcome_label = outcome_var) {
+  
+#  complete_data <- subset(data, complete.cases(data[[baseline_var]], 
+#                                              data[[outcome_var]], 
+#                                              data[[treatment_var]]))
+  complete_data <- data # t-tests and chi-square tests can deal with missing data
+  # Calculate complete group statistics
+  group_stats <- complete_data %>%
+    group_by(!!sym(treatment_var)) %>%
+    summarise(
+      n = n(),
+      mean_outcome = mean(!!sym(outcome_var), na.rm = TRUE),
+      sd_outcome = sd(!!sym(outcome_var), na.rm = TRUE)
+    )
+  
+  # Perform t-test
+  t_test_formula <- as.formula(paste(outcome_var, "~", treatment_var))
+  t_test_result <- t.test(t_test_formula, data = complete_data)
+  
+  # Create visualization with baseline filter
+  filtered_data <- subset(data, data[[baseline_var]] != 0)
+  
+  p <- ggplot(filtered_data, aes_string(x = treatment_var, y = outcome_var)) +
+    geom_boxplot(position = position_dodge(width = 0.8), outlier.alpha = 0.3) +
+    geom_jitter(aes_string(color = treatment_var),
+                position = position_jitterdodge(jitter.width = 0.15, 
+                                               dodge.width = 0.8),
+                alpha = 0.25, size = 1) +
+    labs(x = "Treatment", y = outcome_label, 
+         color = "Treatment", 
+         title = paste(outcome_label, "by Treatment Groups")) +
+    theme_minimal()
+  
+  return(list(complete_data = complete_data, 
+              group_stats = group_stats, 
+              t_test = t_test_result,
+              plot = p))
+}
+```
+
+
+```{r test_results_with_plots}
+# Results of all continuous outcomes
+# PASDAS analysis
+pasdas_results <- cts_outcome(data_factor_2trt, 
+                              "pasdas_po", "pasdas_bsl", 
+                              outcome_label = "PASDAS")
+print(pasdas_results$group_stats)
+print(pasdas_results$t_test)
+print(pasdas_results$plot)
+
+# DAPSA analysis
+dapsa_results <- cts_outcome(data_factor_2trt, 
+                             "dapsa_po", "dapsa_bsl", 
+                             outcome_label = "DAPSA")
+print(dapsa_results$group_stats)
+print(dapsa_results$t_test)
+print(dapsa_results$plot)
+
+# PASI analysis
+pasi_results <- cts_outcome(data_factor_2trt, 
+                            "pasi_po", "pasi_bsl", 
+                            outcome_label = "PASI")
+print(pasi_results$group_stats)
+print(pasi_results$t_test)
+print(pasi_results$plot)
+
+# HAQ analysis
+haq_results <- cts_outcome(data_factor_2trt, 
+                           "haq_po", "haq_bsl", 
+                           outcome_label = "HAQ")
+print(haq_results$group_stats)
+print(haq_results$t_test)
+print(haq_results$plot)
+
+# PSAID analysis
+psaid_results <- cts_outcome(data_factor_2trt, 
+                             "psaid_po", "psaid_bsl", 
+                             outcome_label = "PSAID")
+print(psaid_results$group_stats)
+print(psaid_results$t_test)
+print(psaid_results$plot)
+
+# SJC analysis
+sjc_results <- cts_outcome(data_factor_2trt, 
+                           "sjc_po", "sjc_bsl", 
+                           outcome_label = "Swollen Joint Count")
+print(sjc_results$group_stats)
+print(sjc_results$t_test)
+print(sjc_results$plot)
+
+
+# Results of continuous outcome which requires baseline filtering
+# Enthesitis analysis (Baseline > 0)
+enthesitis_results <- baseline_filter(data_factor_2trt, 
+                                      "enthesitis_po", "enthesitis_bsl", 
+                                      outcome_label = "Enthesitis")
+print(enthesitis_results$group_stats)
+print(enthesitis_results$t_test)
+print(enthesitis_results$plot)
+
+# Dactylitis analysis (Baseline > 0)
+dactylitis_results <- baseline_filter(data_factor_2trt, 
+                                      "dactylitis_po", "dactylitis_bsl", 
+                                      outcome_label = "Dactylitis")
+print(dactylitis_results$group_stats)
+print(dactylitis_results$t_test)
+print(dactylitis_results$plot)
+
+
+# Results of binary outcomes (ACR responses)
+# ACR20 Response analysis
+acr20_results <- bin_outcome(data_factor_2trt, 
+                             "acr20_po", 
+                             outcome_label = "ACR20")
+print(acr20_results$contingency_table)
+print(prop.table(acr20_results$contingency_table, 1))
+print(acr20_results$chi_test)
+print(acr20_results$confidence_intervals)
+print(acr20_results$proportion_test)
+print(acr20_results$plot)
+
+# ACR50 Response analysis
+acr50_results <- bin_outcome(data_factor_2trt, 
+                             "acr50_po", 
+                             outcome_label = "ACR50")
+print(acr50_results$contingency_table)
+print(prop.table(acr50_results$contingency_table, 1))
+print(acr50_results$chi_test)
+print(acr50_results$confidence_intervals)
+print(acr50_results$proportion_test)
+print(acr50_results$plot)
+
+# ACR70 Response analysis
+acr70_results <- bin_outcome(data_factor_2trt, 
+                             "acr70_po",
+                             outcome_label = "ACR70")
+print(acr70_results$contingency_table)
+print(prop.table(acr70_results$contingency_table, 1))
+print(acr70_results$chi_test)
+print(acr70_results$confidence_intervals)
+print(acr70_results$proportion_test)
+print(acr70_results$plot)
+```
+
+#### Data visualization to see relationship between each X and Y
+```{r x_exploration}
+# 1. Analyze relationship between age and PASDAS outcome
+# Linear model
+simplemod_age <- lm(pasdas_po ~ age + treatment + pasdas_bsl, data = data_factor_2trt)
+summary(simplemod_age)
+
+# Scatter plot with regression lines by treatment group
+ggplot(data_factor_2trt, aes(x = age, y = pasdas_po, color = treatment)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = TRUE, level = 0.95) +  
+  labs(x = "Age", y = "PASDAS Primary Outcome", color = "Treatment", fill = "Treatment",
+       title = "Relationship Between Age and PASDAS by Treatment Group") +
+  theme_minimal()
+
+# Distribution of age variable
+hist(data_factor_2trt$age)
+
+
+
+# 2. Analyze relationship between disease duration and PASDAS outcome
+simplemod_duration <- lm(pasdas_po ~ disease_duration + treatment + pasdas_bsl, 
+                        data = data_factor_2trt)
+summary(simplemod_duration)
+
+ggplot(data_factor_2trt, aes(x = disease_duration, y = pasdas_po, color = treatment))+
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = TRUE, level = 0.95) +
+  labs(x = "Disease Duration", y = "PASDAS Primary Outcome", 
+       color = "Treatment", fill = "Treatment",
+       title = "Relationship Between Disease Duration and PASDAS by Treatment Group")+
+  theme_minimal() +
+  coord_cartesian(xlim = c(0, 100), ylim = c(0, 8))
+
+hist(data_factor_2trt$disease_duration)
+
+
+
+# 3. Analyze relationship between BMI and PASDAS outcome
+simplemod_bmi <- lm(pasdas_po ~ BMI + treatment + pasdas_bsl, data = data_factor_2trt)
+summary(simplemod_bmi)
+
+ggplot(data_factor_2trt, aes(x = BMI, y = pasdas_po, color = treatment)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = TRUE, level = 0.95) + 
+  labs(x = "BMI", y = "PASDAS Primary Outcome", color = "Treatment", fill = "Treatment",
+       title = "Relationship Between BMI and PASDAS by Treatment Group") +
+  theme_minimal() +
+  coord_cartesian(xlim = c(15, 50), ylim = c(0, 8)) 
+
+hist(data_factor_2trt$BMI)
+
+
+
+# 4. Analyze relationship between sex and PASDAS outcome
+simplemod_sex <- lm(pasdas_po ~ sex_bin + treatment + pasdas_bsl, data = data_factor_2trt)
+summary(simplemod_sex)
+
+# Box plots for visualization
+ggplot(data_factor_2trt, aes(x = sex_bin, y = pasdas_po, fill = treatment)) +
+  geom_boxplot(position = position_dodge(width = 0.8), outlier.alpha = 0.3) +
+  geom_jitter(aes(color = treatment),
+              position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8),
+              alpha = 0.25, size = 1) +
+  labs(x = "Sex", y = "PASDAS Primary Outcome", 
+       title = "Relationship Between Sex and PASDAS by Treatment Group", 
+       fill = "Treatment", color = "Treatment") +
+  theme_minimal()
+
+
+
+# 5. Analyze relationship between smoking status and PASDAS outcome
+simplemod_smoking <- lm(pasdas_po ~ smoking_bin + treatment + pasdas_bsl, 
+                       data = data_factor_2trt)
+summary(simplemod_smoking)
+
+ggplot(data_factor_2trt, aes(x = smoking_bin, y = pasdas_po, fill = treatment)) +
+  geom_boxplot(position = position_dodge(width = 0.8), outlier.alpha = 0.3) +
+  geom_jitter(aes(color = treatment),
+              position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8),
+              alpha = 0.25, size = 1) +
+  labs(x = "Smoking Status", y = "PASDAS Primary Outcome", 
+       title = "Relationship Between Smoking Status and PASDAS by Treatment Group", 
+       fill = "Treatment", color = "Treatment") +
+  theme_minimal()
+
+
+
+# 6. Analyze relationship between education level and PASDAS outcome 
+simplemod_edu <- lm(pasdas_po ~ education_level + treatment + pasdas_bsl, 
+                   data = data_factor_2trt)
+summary(simplemod_edu)
+
+ggplot(data_factor_2trt, aes(x = education_level, y = pasdas_po, fill = treatment)) +
+  geom_boxplot(position = position_dodge(width = 0.8), outlier.alpha = 0.3) +
+  geom_jitter(aes(color = treatment),
+              position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8),
+              alpha = 0.25, size = 1) +
+  labs(x = "Education Level", y = "PASDAS Primary Outcome", 
+       title = "Relationship Between Education Level and PASDAS by Treatment Group", 
+       fill = "Treatment", color = "Treatment") +
+  theme_minimal()
+
+
+
+# 7. Analyze relationship between occupation status and PASDAS outcome
+simplemod_occupation <- lm(pasdas_po ~ occupation_bin + treatment + pasdas_bsl, 
+                          data = data_factor_2trt)
+summary(simplemod_occupation)
+
+ggplot(data_factor_2trt, aes(x = occupation_bin, y = pasdas_po, fill = treatment)) +
+  geom_boxplot(position = position_dodge(width = 0.8), outlier.alpha = 0.3) +
+  geom_jitter(aes(color = treatment),
+              position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8),
+              alpha = 0.25, size = 1) +
+  labs(x = "Occupation Status", y = "PASDAS Primary Outcome", 
+       title = "Relationship Between Occupation Status and PASDAS by Treatment Group", 
+       fill = "Treatment", color = "Treatment") +
+  theme_minimal()
+```
+
+```{r simple_lm}
+# Simple linear model with all X variables
+simplemod_allfactor_pasdas <- lm(pasdas_po ~ age + sex_bin + disease_duration + BMI + smoking_bin  + treatment + pasdas_bsl, data = data_factor_2trt)
+
+summary(simplemod_allfactor_pasdas)
+```
+
+
+
+

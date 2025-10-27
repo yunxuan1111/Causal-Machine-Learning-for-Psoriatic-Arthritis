@@ -1,0 +1,1014 @@
+---
+title: "Causal Forest Model"
+author: "YJ"
+date: "2025-10-25"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,      
+  eval = FALSE,     
+  results = 'hide', 
+  warning = FALSE,  
+  message = FALSE,  
+  fig.show = 'hide' 
+)
+```
+
+### package loading
+```{r package}
+set.seed(2025)
+library(dplyr)
+library(ggplot2)
+library(grf)
+library(forcats)
+library(tidytext)
+library(ggparty)
+library(partykit)
+library(rpart)
+```
+
+### Data Loading
+```{r data_loading}
+# read data
+data_factor_2trt <- readRDS( "D://Dissertation Dataset//data_factor_2trt.rds")
+head(data_factor_2trt)
+```
+
+```{r onestage_result}
+one_stage_vals <- readRDS("outputs/one_stage_ate.rds")
+one_stage_vals$ATE
+one_stage_vals$CI_lower
+one_stage_vals$CI_upper
+```
+
+
+### Building causal forests: complete pooling, pooling with trial indicator
+```{r causal_forest}
+# Make causal forest models for complete pooling and pooling with trial indicator
+df <- data_factor_2trt %>%
+  filter(!is.na(pasdas_po), !is.na(pasdas_bsl), !is.na(age),
+         !is.na(BMI), !is.na(sex_bin), !is.na(smoking_bin),
+         !is.na(disease_duration), !is.na(trial), !is.na(treatment)) %>%
+  mutate(
+    trial     = factor(trial, levels = c("COMPLETE","GOLMePsA","SPEED","STAMP")),
+    treat01   = ifelse(treatment == "Intensive", 1, 0)
+  )
+
+
+# Oracle propensity by trial
+oracle_map <- c(
+  "COMPLETE"  = 38/(38+39),
+  "GOLMePsA"  = 43/(41+43),
+  "SPEED"     = 112/(49+112),
+  "STAMP"     = 60/(60+60)
+)
+
+df <- df %>% mutate(oracle_ps = unname(oracle_map[as.character(trial)]))
+
+# define variables
+Y <- df$pasdas_po
+W <- df$treat01
+
+# Complete pooling
+X_complete <- model.matrix(~ pasdas_bsl + age + BMI + sex_bin + smoking_bin + disease_duration,
+                           data = df)[, -1]
+
+# Pooling With trial indicator
+X_indicator <- model.matrix(~ pasdas_bsl + age + BMI + sex_bin + smoking_bin + disease_duration + trial,
+                            data = df)[, -1]
+
+# Causal Forests
+cf_complete <- causal_forest(
+  X_complete, Y, W,
+  W.hat = df$oracle_ps,
+  num.trees = 2000,
+  honesty = TRUE,              
+  seed = 2025,
+  tune.parameters = "all"
+)
+
+cf_indicator <- causal_forest(
+  X_indicator, Y, W,
+  W.hat = df$oracle_ps,
+  num.trees = 2000,
+  honesty = TRUE,
+  seed = 2025,
+  tune.parameters = "all"
+)
+```
+
+### Comparing CATE results of two aggregation methods
+```{r cate_compare}
+# Predict CATE of both methods
+cate_complete  <- predict(cf_complete)$predictions
+cate_indicator <- predict(cf_indicator)$predictions
+
+# Compare both methods
+mean_sd_df <- tibble(
+  Method = c("Complete pooling", "Pooling with trial indicator"),
+  Mean   = c(mean(cate_complete), mean(cate_indicator)),
+  SD     = c(sd(cate_complete),   sd(cate_indicator))
+)
+print(mean_sd_df)
+```
+
+### Comparing ATE with IPDMA: average CATE = ATE
+```{r ate_compare}
+# Compare ATE with IPDMA: average CATE ≈ ATE
+# 1. get ATE and standard error
+# Complete pooling
+ate_obj_complete <- average_treatment_effect(cf_complete, target.sample = "all")
+ate_complete <- ate_obj_complete[1]
+se_complete  <- ate_obj_complete[2]
+
+# Pooling with trial indicator
+ate_obj_indicator <- average_treatment_effect(cf_indicator, target.sample = "all")
+ate_indicator <- ate_obj_indicator[1]
+se_indicator  <- ate_obj_indicator[2]
+
+
+# 2. 95% CI
+z_value <- qnorm(0.975)
+
+ci_lower_complete <- ate_complete - z_value * se_complete
+ci_upper_complete <- ate_complete + z_value * se_complete
+
+ci_lower_indicator <- ate_indicator - z_value * se_indicator
+ci_upper_indicator <- ate_indicator + z_value * se_indicator
+
+
+# 3. Make a table for comparison
+summary_df <- tibble(
+  Method   = c("Complete pooling", "Pooling with trial indicator", "One-stage IPD Meta"),
+#  Mean_CATE = c(mean(cate_complete), mean(cate_indicator)), 
+#  SD_CATE   = c(sd(cate_complete),   sd(cate_indicator)),   
+  ATE       = c(ate_complete,      ate_indicator, one_stage_vals$ATE),      
+  CI_lower  = c(ci_lower_complete, ci_lower_indicator, one_stage_vals$CI_lower),
+  CI_upper  = c(ci_upper_complete, ci_upper_indicator, one_stage_vals$CI_upper)
+)
+print(summary_df)
+```
+
+
+### Plotting for data analysis
+#### Sorted CATE plot
+```{r sort_cate}
+# Predict CATE
+pred_ind <- predict(cf_indicator, X_indicator, estimate.variance = TRUE)
+tau_ind  <- as.numeric(pred_ind$predictions)                 
+se_ind   <- sqrt(pmax(pred_ind$variance.estimates, 0))        
+low_i    <- tau_ind - z_value * se_ind
+upp_i    <- tau_ind + z_value * se_ind
+
+# Make a sorted CATE plot with 95% CI
+df_ind <- tibble(tau = tau_ind, lower = low_i, upper = upp_i) |>
+  arrange(tau) |>
+  mutate(rank = row_number())
+
+ggplot(df_ind, aes(rank, tau)) +
+  geom_linerange(aes(ymin = lower, ymax = upper), alpha = 0.15) +
+  geom_line(size = 1.1, color = "black") +
+  labs(x = NULL, y = "CATE Estimate (95% CI)",
+       title = "Causal forest (trial indicator): Sorted CATE with 95% CI") +
+  theme_minimal(base_size = 13)
+```
+
+#### Histogram of CATE Distribution
+```{r histogram}
+ggplot(data.frame(cate = cate_indicator), aes(x = cate)) +
+  geom_histogram(bins = 30, fill = "#69b3a2", alpha = 0.55) +
+  labs(title = "Distribution of Individual CATE", x = "CATE", y = "Count") +
+  theme_minimal()
+```
+
+#### Variable Importance Plot (combined dataset)
+```{r im_plot_comb}
+vi <- variable_importance(cf_indicator)
+vi_df <- data.frame(Variable = colnames(X_indicator), Importance = vi)
+ggplot(vi_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "#69b3a2") +
+  coord_flip() +
+  labs(title = "Variable Importance in Causal Forest", x = "Variable", y = "Importance")
+```
+
+#### Variable Importance Plot by trial
+```{r im_plot_trial}
+# Create unified base design matrix (excluding trial indicators to avoid confounding trial differences with variable importance)
+X_base <- model.matrix(~ pasdas_bsl + age + BMI + disease_duration + sex_bin + smoking_bin,
+                       data = df)[, -1]
+base_varnames <- colnames(X_base)
+
+# Function to fit causal forest and extract variable importance for a single trial
+fit_vi_one_trial <- function(tr_nm) {
+  idx <- df$trial == tr_nm
+  X_tr <- X_base[idx, , drop = FALSE]
+  Y_tr <- Y[idx]
+  W_tr <- W[idx]
+  ps_tr <- df$oracle_ps[idx]  # oracle PS of that trial
+
+# Fit causal forest with oracle propensity scores
+  cf_tr <- causal_forest(
+    X_tr, Y_tr, W_tr,
+    W.hat = ps_tr,
+    honesty = TRUE,
+    num.trees = 2000,  
+    tune.parameters = "all",
+    seed = 2025
+  )
+  
+# Extract variable importance
+  vi <- variable_importance(cf_tr)
+  tibble(
+    Trial = tr_nm,
+    Variable = base_varnames,
+    Importance = as.numeric(vi)
+  )
+}
+
+# Loop through all four trials and combine results
+trials <- levels(df$trial)  # c("COMPLETE","GOLMePsA","SPEED","STAMP")
+vi_by_trial <- dplyr::bind_rows(lapply(trials, fit_vi_one_trial))
+
+# Order variables by importance within each trial
+vi_by_trial <- vi_by_trial %>%
+  group_by(Trial) %>%
+  mutate(Variable_plot = reorder_within(Variable, Importance, Trial)) %>%
+  ungroup()
+
+# Showing variable importance by trial
+p_vi_by_trial <- ggplot(vi_by_trial, aes(x = Variable_plot, y = Importance)) +
+  geom_col(fill = "#69b3a2") +
+  coord_flip() +
+  facet_wrap(~ Trial, ncol = 2, scales = "free_y") +
+  scale_x_reordered() +
+  labs(title = "Variable importance by trial",
+       x = NULL, y = "Variable importance") +
+  theme_minimal(base_size = 12)
+print(p_vi_by_trial)
+```
+
+```{r}
+# sample size of each trial
+trial_sample_sizes <- df %>%
+  count(trial)  
+
+print(trial_sample_sizes)
+```
+
+
+#### Make BLP
+```{r, echo = TRUE}
+blp <- best_linear_projection(cf_indicator, X_indicator)
+print(blp)
+```
+
+#### Explore CATE vs each X covariate
+```{r}
+# Predict CATE
+cate_hat <- predict(cf_indicator)$predictions
+
+# Prepare data for plotting
+plot_df <- df %>%
+  mutate(trial = fct_inorder(as.factor(trial))) %>%
+  mutate(CATE = cate_hat) %>%
+  select(CATE, trial, pasdas_bsl, age, BMI, disease_duration, sex_bin, smoking_bin)
+```
+
+```{r}
+# Function to plot CATE vs continuous variables: scatter plot with smoothing line
+plot_cate_vs_cont <- function(dat, xvar, add_smooth = TRUE) {
+  p <- ggplot(dat, aes_string(x = xvar, y = "CATE", colour = "trial")) +
+    geom_point(alpha = 0.6, size = 1.6) +
+    { if (add_smooth) geom_smooth(se = FALSE, method = "loess", size = 0.8) } +
+    labs(title = paste("CATE vs", xvar, "(by trial)"),
+         x = xvar, y = "CATE estimate") +
+    theme_minimal() +
+    theme(legend.position = "right")
+  p
+}
+
+# Function to plot CATE vs categorical variables: boxplot with jittered points
+plot_cate_vs_cat <- function(dat, xvar) {
+  p <- ggplot(dat, aes_string(x = xvar, y = "CATE", fill = "trial", colour = "trial")) +
+    geom_boxplot(alpha = 0.35, outlier.shape = NA, width = 0.6, position = position_dodge(width = 0.7)) +
+    geom_jitter(position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.7),
+                alpha = 0.5, size = 1.2) +
+    labs(title = paste("CATE by", xvar, "(grouped by trial)"),
+         x = xvar, y = "CATE estimate") +
+    theme_minimal() +
+    theme(legend.position = "right")
+  p
+}
+```
+
+
+```{r xplot}
+# Continuous x
+p_age   <- plot_cate_vs_cont(plot_df, "age")
+p_base  <- plot_cate_vs_cont(plot_df, "pasdas_bsl")
+p_bmi   <- plot_cate_vs_cont(plot_df, "BMI") + coord_cartesian(xlim = c(NA, 50))
+p_ddur  <- plot_cate_vs_cont(plot_df, "disease_duration") 
+
+# Binary x
+p_sex   <- plot_cate_vs_cat(plot_df, "sex_bin")
+p_smoke <- plot_cate_vs_cat(plot_df, "smoking_bin")
+
+# Show the plots
+print(p_age)
+print(p_base)
+print(p_bmi) 
+print(p_ddur)
+print(p_sex) 
+print(p_smoke)
+```
+
+### Model Diagnostics and Validation
+#### Calibration Test
+```{r cali}
+# Calibration Test
+cat("\n--- Model Calibration Test ---\n")
+calibration_results <- test_calibration(cf_indicator)
+print(calibration_results)
+```
+
+#### Leave-One-Study-Out Cross-Validation
+```{r loso}
+# get unique trial names
+trials <- unique(df$trial)
+
+results_list <- list()
+Y_full <- df$pasdas_po
+W_full <- df$treat01
+ps_full <- df$oracle_ps
+X_full <- model.matrix(~ pasdas_bsl + age + BMI + sex_bin + smoking_bin + disease_duration + trial,
+                       data = df)[, -1]
+
+
+# Perform Leave-One-Study-Out (LOSO) cross-validation
+for (held_out_trial in trials) {
+  
+  cat("Holding out trial:", as.character(held_out_trial), "\n")
+  
+  # Split data into training and test sets
+  train_indices <- which(df$trial != held_out_trial)
+  test_indices  <- which(df$trial == held_out_trial)
+  
+  # Create training data subsets
+  X_train <- X_full[train_indices, ]
+  Y_train <- Y_full[train_indices]
+  W_train <- W_full[train_indices]
+  ps_train <- ps_full[train_indices]
+  
+  # Train causal forest model on training data
+  cf_loo <- causal_forest(
+    X = X_train,
+    Y = Y_train,
+    W = W_train,
+    W.hat = ps_train,
+    num.trees = 2000,
+    honesty = TRUE,
+    seed = 2025,
+    tune.parameters = "all"
+  )
+  
+  # Prepare test data and make predictions
+  X_test <- X_full[test_indices, , drop = FALSE] 
+  predictions <- predict(cf_loo, newdata = X_test)
+  
+  # Store prediction results in list
+  results_list[[as.character(held_out_trial)]] <- data.frame(
+    original_row_index = test_indices, 
+    held_out_trial = held_out_trial, 
+    predicted_cate = predictions$predictions
+  )
+}
+
+
+
+# Combine all data frames from the results list into one
+all_predictions_df <- dplyr::bind_rows(results_list)
+
+# Merge predictions back into original dataframe using row indices
+df_with_preds <- df %>%
+  mutate(original_row_index = row_number()) %>%
+  left_join(all_predictions_df, by = "original_row_index")
+```
+
+```{r loso_plot}
+# Create boxplot using ggplot2 to visualize CATE predictions across held-out trials
+ggplot(df_with_preds, aes(x = held_out_trial, y = predicted_cate, fill = held_out_trial)) +
+  geom_boxplot(alpha = 0.8) +
+  geom_jitter(width = 0.1, height = 0, alpha = 0.2) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Leave-One-Study-Out CATE Predictions",
+    subtitle = "CATEs predicted for each trial when it was held out from training",
+    x = "Held-out Trial (Test Set)",
+    y = "Predicted CATE"
+  ) +
+  theme(legend.position = "none") 
+```
+
+```{r}
+# Calculate summary statistics for predicted CATEs in each held-out trial
+summary_stats <- df_with_preds %>%
+  group_by(held_out_trial) %>%
+  summarize(
+    mean_predicted_cate = mean(predicted_cate),
+    sd_predicted_cate = sd(predicted_cate),
+    n = n()
+  )
+
+print(summary_stats)
+```
+
+
+
+
+### CDT
+#### Revise the plot_cdt code, which is a function from "causalDT" Rpackage
+```{r}
+# Define the new plotting function
+plot_cdt_with_n <- function(cdt, show_digits = 3) {
+  # Author's original code
+  breaks_label <- NULL
+  splitvar <- NULL
+  estimate <- NULL
+  label <- NULL
+  info <- NULL
+  .n1 <- NULL 
+  .n0 <- NULL
+  
+  party_obj <- partykit::as.party(cdt$student_fit$fit)
+  plt <- ggparty::ggparty(party_obj) +
+    ggparty::geom_edge() +
+    ggparty::geom_edge_label(
+      ggplot2::aes(
+        label = substr(breaks_label, start = 1, stop = 12 + show_digits)
+      )
+    ) +
+    ggparty::geom_node_label(ggplot2::aes(label = splitvar), ids = "inner")
+  
+  # Start revising
+  subgroup_labels <- data.frame(id = plt$data$id) |>
+    dplyr::left_join(cdt$estimate, by = c("id" = "leaf_id")) |>
+    dplyr::mutate(
+      # 1. calculate whole sample size in each leaf
+      total_n = .n1 + .n0,
+      
+      # 2. Set labels that contain both ATE and n in each leaf
+      label = ifelse(
+        !is.na(estimate),
+        sprintf(paste0("ATE = %.", show_digits, "f\nn = %d"), estimate, total_n),
+        "" 
+      )
+    ) |>
+    dplyr::pull(label)
+  
+  # Author's original code (add the label to the plot)
+  plt$data$info <- subgroup_labels
+  plt <- plt +
+    ggparty::geom_node_label(ggplot2::aes(label = info), ids = "terminal")
+  
+  return(plt)
+}
+```
+
+
+#### Teacher model (with default parameters)
+```{r}
+library(causalDT)
+set.seed(2025)
+
+Y <- df$pasdas_po                  
+Z <- df$treat01   # Use it in causal tree
+X_indicator <- model.matrix(
+  ~ pasdas_bsl + age + BMI + sex_bin + smoking_bin + disease_duration + trial,
+  data = df
+)[, -1, drop = FALSE]
+# 1) Define teacher model: cf_indicator
+teacher_cf_fixed <- function(X, Y, Z, W, ...) {
+  cf_indicator
+}
+# 2) Use teacher model to predict CATE
+teacher_cf_predict <- function(model, x) {
+  as.numeric(predict(model, x)$predictions)
+}
+
+
+# Make CDT with our previous causal forest model
+cdt_fit <- causalDT(
+  X = X_indicator, Y = df$pasdas_po, Z = df$treat01,
+  W = df$oracle_ps,                     
+  holdout_prop = 0.3,
+  teacher_model   = teacher_cf_fixed,
+  teacher_predict = teacher_cf_predict,
+  rpart_control   = rpart::rpart.control(maxdepth = 5))    
+
+
+# Visualize the subgroup tree (default parameters)
+plot_cdt_with_n(cdt_fit)
+
+# Display honest estimates: ATE + variance + sample size for each subgroup
+cdt_fit$estimate
+# Make a jaccard plot for this default CDT
+# plot_jaccard(`Causal Forest` = cdt_fit)
+```
+
+# Compare CDT with causal tree
+```{r}
+# Define causal tree estimator function
+causal_tree_estimator <- function(X, Y = NULL, y = NULL, Z, maxdepth = NULL, cp = 0, propensity = NULL, ...) {
+  if (is.null(Y) && !is.null(y)) Y <- y
+
+  Z <- as.numeric(Z)
+  data_b <- data.frame(Y = Y, Z = Z, X)
+
+  formula_ct <- as.formula(paste("Y ~", paste(sprintf("`%s`", colnames(X)), collapse = " + ")))
+  ctrl <- rpart::rpart.control(cp = cp)
+  if (!is.null(maxdepth)) ctrl$maxdepth <- as.integer(maxdepth)
+
+  if (is.null(propensity)) {
+    ps_hat <- glm(Z ~ ., data = data_b[, c("Z", colnames(X))], family = binomial())$fitted.values
+  } else {
+    ps_hat <- propensity
+  }
+  
+  # Fit causal tree with suppressed output to avoid cluttering
+  ct_fit <- NULL
+  suppressMessages(suppressWarnings({
+    junk <- capture.output({
+      ct_fit <- causalTree::causalTree(
+        formula      = formula_ct,
+        data         = data_b,
+        treatment    = data_b$Z,
+        split.Honest = TRUE,
+        split.Rule   = "CT",
+        cv.option    = "CT",
+        cv.Honest    = TRUE,
+        xval         = 5,
+        split.Bucket = TRUE,
+        split.alpha = 0.7,
+        propensity   = ps_hat,
+        control      = ctrl
+      )
+    })
+  }))
+
+  return(invisible(ct_fit))
+}
+
+
+set.seed(2025)
+
+# Make a causal tree
+ct_initial_fit <- causal_tree_estimator(
+  X = X_indicator, Y = Y, Z = Z, maxdepth = 5, cp = 0
+)
+
+# Stability Check
+ct_stability <- evaluate_subgroup_stability(
+  estimator = causal_tree_estimator,
+  fit       = ct_initial_fit,
+  X         = X_indicator,
+  y         = Y,   
+  Z         = Z,
+  B         = 100  # default value in causalDT (Jaccard SSI part) package
+)
+
+# Make a SSI plot combining two methods
+cdt_ssi_df <- data.frame(
+  depth       = seq_along(cdt_fit$stability$jaccard_mean),
+  jaccard_ssi = cdt_fit$stability$jaccard_mean,
+  method      = "Causal Distillation Tree"
+)
+
+ct_ssi_df <- data.frame(
+  depth       = seq_along(ct_stability$jaccard_mean),
+  jaccard_ssi = ct_stability$jaccard_mean,
+  method      = "Causal Tree"
+)
+
+ssi_both <- dplyr::bind_rows(cdt_ssi_df, ct_ssi_df)
+max_depth <- max(ssi_both$depth, na.rm = TRUE)
+
+ggplot(ssi_both, aes(x = depth, y = jaccard_ssi, color = method)) +
+  geom_line() + geom_point() +
+  scale_x_continuous(breaks = seq_len(max_depth)) +
+  labs(x = "Tree depth", y = "Jaccard SSI", color = NULL,
+       title = "Stability: CDT vs. Causal Tree") +
+  theme_classic()
+```
+
+
+
+
+
+
+
+
+#### CDT (maxdepth = 2, minbucket=50)
+```{r}
+set.seed(2025)
+cdt_fit_user_2_50 <- causalDT(
+  X = X_indicator, Y = df$pasdas_po, Z = df$treat01,
+  W = df$oracle_ps,
+  teacher_model   = teacher_cf_fixed,
+  teacher_predict = teacher_cf_predict,
+  rpart_control = rpart::rpart.control(maxdepth = 2, minbucket=50)
+)
+
+plot_cdt_with_n(cdt_fit_user_2_50)
+cdt_fit_user_2_50$estimate  
+```
+
+```{r}
+est_ci_tbl <- cdt_fit_user_2_50$estimate %>%
+  mutate(
+    se  = sqrt(variance),
+    crit_t = qt(0.975, df = .n1 + .n0 - 2),                     
+    ci_low  = estimate - crit_t * se,  # qt(0.975, df)
+    ci_high = estimate + crit_t * se,
+    subgroup_rule = vapply(subgroup, function(x) paste(x, collapse = " & "), character(1))
+  ) %>%
+  select(leaf_id, subgroup_rule, estimate, se, variance, .n1, .n0, ci_low, ci_high)
+
+est_ci_tbl
+```
+
+
+
+#### CDT(maxdepth = 3, minbucket=30)
+```{r}
+set.seed(2025)
+cdt_fit_user_3_30 <- causalDT(
+  X = X_indicator, Y = df$pasdas_po, Z = df$treat01,
+  W = df$oracle_ps,
+  teacher_model   = teacher_cf_fixed,
+  teacher_predict = teacher_cf_predict,
+  rpart_control = rpart::rpart.control(maxdepth = 3, minbucket = 30)
+)
+
+plot_cdt_with_n(cdt_fit_user_3_30)
+cdt_fit_user_3_30$estimate   
+```
+
+```{r}
+est_ci_tbl <- cdt_fit_user_3_30$estimate %>%
+  mutate(
+    se  = sqrt(variance),
+    crit_t = qt(0.975, df = .n1 + .n0 - 2),                    
+    ci_low  = estimate - crit_t * se,
+    ci_high = estimate + crit_t * se,
+    subgroup_rule = vapply(subgroup, function(x) paste(x, collapse = " & "), character(1))
+  ) %>%
+  select(leaf_id, subgroup_rule, estimate, se, variance, .n1, .n0, ci_low, ci_high)
+
+est_ci_tbl
+```
+
+
+### Stability Check Minbuckets (revise based on grf author's codes)
+```{r}
+# 1) Stability function: supports externally provided boot_idx_list (fixed bootstrap indices)
+evaluate_subgroup_stability_revise <- function(estimator, fit, X, y, Z = NULL,
+                                               rpart_control = NULL,
+                                               B = 100,
+                                               max_depth = NULL,
+                                               X_train = NULL, y_train = NULL,   # ADDED: training data for bootstrap
+                                               X_ref = NULL,                     # ADDED: reference set for prediction
+                                               boot_idx_list = NULL              # ADDED: fixed bootstrap indices (length should be ≥ 2*B)
+                                               ) {
+
+  # To avoid "no visible binding" error from R CMD check
+  feature <- NULL
+  depth <- NULL
+
+  # Check if input is an rpart object
+  if (!("rpart" %in% class(fit))) {
+    warning(
+      "fit is not an rpart object. ",
+      "Stability diagnostics have only been implemented for the rpart student model. ",
+      "Skipping stability diagnostics."
+    )
+    return(NULL)
+  } else if ((B == 0) || is.null(fit)) {
+    return(NULL)
+  }
+
+  # Convert original fit to party object and get node depths
+  fit_orig <- partykit::as.party(fit)
+  node_depths_orig <- causalDT:::get_party_node_depths(fit_orig)
+
+  # Get leaf IDs for reference set (use X if X_ref not provided)
+  if (is.null(X_ref)) X_ref <- X                                      # ADDED: default to X if no reference set
+  leaf_ids_orig <- predict(fit_orig, data.frame(X_ref), type = "node") # CHANGED: use reference set
+
+  # Set max_depth if not provided
+  if (is.null(max_depth)) {
+    max_depth <- max(max(node_depths_orig), 4)
+  }
+
+  # Set rpart control parameters (preserve existing settings)
+  # CHANGED: don't forcibly override existing rpart_control
+  # rpart_control[["minsplit"]]  <- 2
+  # rpart_control[["minbucket"]] <- 1
+  # rpart_control[["cp"]]        <- 0
+  rpart_control[["maxdepth"]] <- max_depth
+  estimator <- purrr::partial(estimator, rpart_control = rpart_control)
+
+  # Determine bootstrap population 
+  X_boot <- if (!is.null(X_train)) X_train else X                      # ADDED: use training data for bootstrap
+  y_boot <- if (!is.null(y_train)) y_train else y                      # ADDED: use training data for bootstrap
+
+  # Generate bootstrap indices if not provided externally
+  # ADDED: use external bootstrap indices if provided, otherwise generate internally
+  if (is.null(boot_idx_list)) {                                        # ADDED: check for external indices
+    boot_idx_list <- replicate(2 * B, sample.int(nrow(X_boot), nrow(X_boot), replace = TRUE),
+                               simplify = FALSE)
+  } else {
+    # Validate that enough bootstrap indices are provided
+    if (length(boot_idx_list) < (2 * B)) {
+      stop("boot_idx_list length < 2*B. Please generate sufficient bootstrap indices.") # ADDED: validation
+    }
+  }
+
+  # Fit bootstrap models
+  bootstrap_out <- purrr::map(
+    1:(2 * B),
+    function(b) {
+      bootstrap_idx <- boot_idx_list[[b]]                              # CHANGED: use fixed indices
+      X_b <- X_boot[bootstrap_idx, , drop = FALSE]                     # CHANGED: use bootstrap population
+      y_b <- y_boot[bootstrap_idx]                                     # CHANGED: use bootstrap population
+      if (is.null(Z)) {
+        fit_b <- estimator(X = X_b, y = y_b, fit_only = TRUE)
+      } else {
+        # Note: if Z_train is needed, pass Z_train and sample it here
+        fit_b <- estimator(X = X_b, Y = y_b, Z = Z[bootstrap_idx])     # CHANGED: sample Z accordingly
+      }
+      if (!is.null(fit_b)) {
+        fit_b <- partykit::as.party(fit_b)
+        node_depths_b <- causalDT:::get_party_node_depths(fit_b)
+        return(list("fit" = fit_b, "node_depths" = node_depths_b))
+      } else {
+        return(NULL)
+      }
+    }
+  ) |>
+    purrr::compact()
+
+  bootstrap_fits <- purrr::map(bootstrap_out, "fit")
+  node_depths    <- purrr::map(bootstrap_out, "node_depths")
+
+  # Initialize storage for stability metrics
+  reach_prop <- numeric(max_depth)                                     # ADDED: proportion of trees reaching each depth
+  Js         <- vector("list", max_depth)                              # Jaccard similarity indices
+  preds_mean <- vector("list", max_depth)                              # Mean predictions
+  preds_var  <- vector("list", max_depth)                              # Prediction variance
+
+  # Calculate stability metrics for each depth
+  for (n_depth in 1:max_depth) {
+    # Identify trees that can reach current depth
+    can_reach <- vapply(node_depths, function(nd) max(nd) >= n_depth, logical(1))   # ADDED: check depth reachability
+    reach_prop[n_depth] <- mean(can_reach)                                          # ADDED: calculate reach proportion
+    idx <- which(can_reach)                                                         # ADDED: subset reachable trees
+    if (length(idx) < 2) {
+      Js[[n_depth]]        <- NA_real_
+      preds_mean[[n_depth]] <- NA
+      preds_var[[n_depth]]  <- NA
+      next
+    }
+
+    fits_sub <- bootstrap_fits[idx]                                                 # ADDED: subset reachable fits
+    nds_sub  <- node_depths[idx]                                                    # ADDED: subset reachable depths
+
+    # Get leaf IDs and predictions on reference set for pruned trees
+    bootstrap_leaf_ids <- purrr::map2(fits_sub, nds_sub, function(fit_b, nd_b) {
+      fit_b_pruned <- if (max(nd_b) > n_depth)
+        partykit::nodeprune(fit_b, ids = names(nd_b)[nd_b == n_depth])
+      else fit_b
+      predict(fit_b_pruned, data.frame(X_ref), type = "node")                       # CHANGED: use reference set
+    })
+
+    bootstrap_leaf_preds <- purrr::map2(fits_sub, nds_sub, function(fit_b, nd_b) {
+      fit_b_pruned <- if (max(nd_b) > n_depth)
+        partykit::nodeprune(fit_b, ids = names(nd_b)[nd_b == n_depth])
+      else fit_b
+      predict(fit_b_pruned, data.frame(X_ref))                                      # CHANGED: use reference set
+    })
+
+    # Calculate Jaccard similarity indices for pairs of bootstrap samples
+    n_pairs <- floor(length(bootstrap_leaf_ids) / 2)                                 # ADDED: number of available pairs
+    if (n_pairs >= 1) {
+      J <- purrr::map_dbl(1:n_pairs, ~ causalDT:::jaccardSSI(
+        as.numeric(as.factor(bootstrap_leaf_ids[[.x * 2 - 1]])) - 1,
+        as.numeric(as.factor(bootstrap_leaf_ids[[.x * 2]])) - 1
+      ))
+      Js[[n_depth]] <- J
+    } else {
+      Js[[n_depth]] <- NA_real_
+    }
+
+    # Calculate prediction statistics
+    mm <- do.call(cbind, bootstrap_leaf_preds)                                      # ADDED: combine predictions
+    preds_mean[[n_depth]] <- rowMeans(mm)                                           # ADDED: mean predictions
+    preds_var[[n_depth]]  <- apply(mm, 1, var)                                      # ADDED: prediction variance
+  }
+
+  # Calculate feature importance distribution
+  feature_dist <- purrr::map(
+    bootstrap_fits, ~ causalDT:::get_party_node_depths(.x, return_features = TRUE)
+  ) |>
+    dplyr::bind_rows(.id = "bootstrap_idx") |>
+    dplyr::filter(!is.na(feature)) |>
+    dplyr::group_by(depth, feature) |>
+    dplyr::summarise(freq = dplyr::n(), .groups = "drop")
+
+  # Return comprehensive stability results
+  list(
+    jaccard_mean               = sapply(Js, function(v) mean(v, na.rm = TRUE)),
+    jaccard_distribution       = Js,
+    reach_prop                 = reach_prop,        # ADDED: depth reachability proportion
+    feature_distribution       = feature_dist,
+    bootstrap_predictions_mean = preds_mean,
+    bootstrap_predictions_var  = preds_var,
+    leaf_ids                   = leaf_ids_orig
+  )
+}
+```
+
+```{r}
+# 2) Global setup: fixed honest split + fixed reusable bootstrap indices
+
+# ADDED: Fixed honest split (shared across entire grid search)
+set.seed(2025)                                                         # ADDED: for reproducibility
+n_all        <- nrow(X_indicator)                                      # ADDED: total sample size
+hold_fixed   <- sample.int(n_all, size = floor(0.30 * n_all))          # ADDED: fixed holdout indices
+train_fixed  <- setdiff(seq_len(n_all), hold_fixed)                    # ADDED: fixed training indices
+X_eval_fixed <- X_indicator[hold_fixed,  , drop = FALSE]               # ADDED: fixed evaluation features
+X_tr_fixed   <- X_indicator[train_fixed, , drop = FALSE]               # ADDED: fixed training features
+
+# ADDED: Training targets (consistent with student; fallback to teacher if needed)
+y_tr_like_fixed <- if (exists("cf_indicator")) {                       # ADDED: check for causal forest
+  teacher_cf_predict(teacher_cf_fixed(X_indicator, Y, Z, df$oracle_ps),
+                     X_tr_fixed)
+} else {
+  teacher_cf_predict(teacher_cf_fixed(X_indicator, Y, Z, df$oracle_ps),
+                     X_tr_fixed)
+}
+
+# ADDED: Generate and fix bootstrap indices (reused across all hyperparameters)
+set.seed(2026)                                                         # ADDED: different seed for bootstrap
+B_BOOT <- 200                                                          # ADDED: number of bootstrap samples (adjustable)
+boot_idx_list_fixed <- replicate(2 * B_BOOT,
+  sample.int(n = nrow(X_tr_fixed), size = nrow(X_tr_fixed), replace = TRUE),
+  simplify = FALSE
+)                                                                       # ADDED: fixed bootstrap indices
+```
+
+```{r}
+# 3) Single fitting function (using fixed split and bootstrap indices)
+
+fit_cdt_once <- function(d, mb, B_boot = B_BOOT) {                     # CHANGED: default to external B_BOOT
+  # CHANGED: set.seed moved before causalDT (if internal randomness exists)
+  # set.seed(2025)  # (no longer needed repeatedly; split is fixed)     # CHANGED/REMOVED
+
+  # Train CDT (explicitly pass fixed holdout_idxs)
+  out <- suppressWarnings(suppressMessages(causalDT(
+    X = X_indicator, Y = df$pasdas_po, Z = df$treat01, W = df$oracle_ps,
+    teacher_model   = teacher_cf_fixed,
+    teacher_predict = teacher_cf_predict,
+    holdout_idxs    = hold_fixed,                                      # ADDED: fixed split
+    rpart_control   = rpart::rpart.control(
+      maxdepth  = d, minbucket = mb, minsplit = mb, cp = 1e-4
+    ),
+    B_stability   = 0,
+    student_prune = "none"
+  )))
+
+  # Evaluation on fixed holdout set
+  X_eval <- X_eval_fixed                                               # CHANGED: use fixed evaluation set
+  hold   <- hold_fixed                                                 # CHANGED: use fixed holdout indices
+  train  <- train_fixed                                                # CHANGED: use fixed training indices
+
+  # Target y_eval: prioritize package's holdout predictions; fallback if needed
+  y_eval <- NULL
+  if (!is.null(out$student_fit$predictions_holdout)) {
+    y_eval <- out$student_fit$predictions_holdout
+  } else if (!is.null(out$student_fit$predictions) &&
+             length(out$student_fit$predictions) == nrow(X_indicator)) {
+    y_eval <- out$student_fit$predictions[hold]
+  } else {
+    y_eval <- teacher_cf_predict(teacher_cf_fixed(X_indicator, Y, Z, df$oracle_ps), X_eval)
+  }
+
+  # CHANGED: Training targets for bootstrap, reuse fixed version
+  y_train_like <- y_tr_like_fixed                                      # CHANGED: use fixed training targets
+
+  # Stability assessment: bootstrap on training set; comparison on fixed reference set (holdout)
+  stab <- suppressWarnings(suppressMessages(
+    evaluate_subgroup_stability_revise(
+      estimator      = student_rpart,
+      fit            = out$student_fit$fit,
+      # Backward compatibility: still pass X/y as eval (won't be used for bootstrap)
+      X              = X_eval,
+      y              = y_eval,
+      # ADDED: bootstrap population (training set, fixed)
+      X_train        = X_tr_fixed,
+      y_train        = y_train_like,
+      # ADDED: fixed reference set (holdout)
+      X_ref          = X_eval_fixed,
+      rpart_control  = rpart::rpart.control(
+        maxdepth  = d,
+        minbucket = mb,
+        minsplit  = mb,
+        cp        = 1e-4
+      ),
+      B              = B_boot,
+      boot_idx_list  = boot_idx_list_fixed[seq_len(2 * B_boot)]        # ADDED: reuse fixed bootstrap indices
+    )
+  ))
+
+  invisible(list(out = out, stab = stab))
+}
+
+
+
+# 4) Grid search (remaining logic unchanged)
+depth_set <- c(2,3)
+mb_set    <- c(10, 20, 30, 40, 50, 60)
+
+# Perform grid search across depth and minbucket combinations
+grid_res <- purrr::cross_df(list(depth = depth_set, minbucket = mb_set)) |>
+  dplyr::mutate(
+    res   = purrr::map2(depth, minbucket, fit_cdt_once),
+    SSI_d = purrr::map2_dbl(res, depth, ~ {
+      jm <- .x$stab$jaccard_mean
+      if (is.null(jm)) return(NA_real_)
+      if (length(jm) >= .y) jm[.y] else NA_real_
+    })
+  )
+
+# Filter by reachability threshold
+grid_res <- grid_res %>%
+  dplyr::mutate(
+    reach = purrr::map2_dbl(res, depth, ~ .x$stab$reach_prop[.y]),
+    SSI_d = ifelse(reach >= 0.8, SSI_d, NA_real_)  # reach filter (adjust threshold as needed)
+  )
+
+# Calculate additional stability statistics
+grid_res <- grid_res %>%
+  dplyr::mutate(
+    SSI_med = purrr::map2_dbl(res, depth, ~ median(.x$stab$jaccard_distribution[[.y]], na.rm = TRUE)),  # CHANGED: add na.rm
+    SSI_lo  = purrr::map2_dbl(res, depth, ~ quantile(.x$stab$jaccard_distribution[[.y]], 0.025, na.rm=TRUE)),
+    SSI_hi  = purrr::map2_dbl(res, depth, ~ quantile(.x$stab$jaccard_distribution[[.y]], 0.975, na.rm=TRUE))
+  )
+
+# Select best minbucket for each depth based on highest SSI(d)
+winners <- grid_res |>
+  dplyr::group_by(depth) |>
+  dplyr::arrange(dplyr::desc(SSI_d), minbucket) |>
+  dplyr::slice(1) |>
+  dplyr::ungroup()
+
+winners
+```
+
+
+```{r}
+# 5) Plotting stability plot for minbucket
+
+# Prepare data for plotting
+ssi_df <- grid_res %>%
+  dplyr::select(depth, minbucket, SSI_d) %>%
+  dplyr::filter(!is.na(SSI_d)) %>%
+  dplyr::mutate(depth = factor(depth, levels = sort(unique(depth))))
+
+# Create stability plot
+p <- ggplot(ssi_df, aes(x = minbucket, y = SSI_d, group = 1)) +
+  geom_line(size = 0.3, color = "black") +
+  geom_point(size = 2, color = "black") +
+  facet_wrap(~ depth, labeller = label_both) +
+  labs(
+    title = "Fixed-Depth Stability: SSI vs. minbucket",
+    x = "minbucket (student tree)",
+    y = "Jaccard SSI at depth d"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    strip.background = element_rect(fill = NA, colour = "black", size = 0.7),
+    panel.border     = element_rect(fill = NA, colour = "black", size = 0.7),
+    plot.title       = element_text(face = "bold")
+  )
+print(p)
+
+# Save plot
+ggsave("ssi_fixed_depth.png", p, width = 9, height = 5, dpi = 150)
+```
+
+
+
+
+

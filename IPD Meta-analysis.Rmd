@@ -1,0 +1,390 @@
+---
+title: "IPD Meta-analysis"
+author: "YJ"
+date: "2025-10-25"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,      
+  eval = FALSE,     
+  results = 'hide', 
+  warning = FALSE,  
+  message = FALSE,  
+  fig.show = 'hide' 
+)
+```
+
+
+### Data Loading
+```{r packages_loading}
+# Packages loading
+library(lme4)         # (one-stage model)
+library(metafor)      # (two-stage model)
+library(broom.mixed) 
+library(performance) 
+library(influence.ME)
+library(ggplot2)
+library(dplyr)
+library(purrr)
+library(lmerTest)    # use it for Satterthwaite CI
+```
+
+```{r data_loading}
+# Data Loading
+data_factor_2trt <- readRDS( "D://Dissertation Dataset//data_factor_2trt.rds") %>%
+  mutate(
+    trial = as.factor(trial),
+    sex_bin = as.factor(sex_bin),
+    smoking_bin = as.factor(smoking_bin),
+    treatment01   = ifelse(treatment == "Intensive", 1L, 0L)
+  )
+head(data_factor_2trt)
+```
+
+### Initial one-stage model
+```{r initial_model}
+# With random intercept and slope
+initial_mod <- lmer(pasdas_po ~ treatment01 + pasdas_bsl + age + BMI + 
+               sex_bin + disease_duration + smoking_bin + 
+               (1 + treatment01 | trial), 
+               data = data_factor_2trt, REML = TRUE)
+
+summary(initial_mod)
+```
+
+### We find initial model singular so we consider the sanity check model, which is a simpler model.
+```{r sanity_model}
+# sanity check model (random intercept only)
+sanity_mod <- lmer(pasdas_po ~ treatment01 + pasdas_bsl + age + BMI + 
+               sex_bin + disease_duration + smoking_bin + 
+               (1 | trial), 
+               data = data_factor_2trt, REML = TRUE)
+
+summary(sanity_mod)
+```
+### The sanity model achieves convergence and is non-singular, so then move to diagnostics check
+```{r diagnostics_check}
+# Diagnostic plots and checks for model assumptions
+diagnostics <- function(model) {
+  par(mfrow = c(2, 2))
+  
+  # Residuals vs fitted values - check for homoscedasticity
+  plot(fitted(model), residuals(model), 
+       main = "Residuals vs Fitted Values",
+       xlab = "Fitted Values", ylab = "Residuals")
+  abline(h = 0, col = "red")
+  
+  # Q-Q plot for normality - check residual normality
+  qqnorm(residuals(model), main = "Q-Q Plot of Residuals")
+  qqline(residuals(model), col = "red")
+  
+  # Residual histogram - check distribution shape
+  hist(residuals(model), main = "Distribution of Residuals",
+       xlab = "Residuals")
+  
+  # Random effects diagnostics - check normality of random intercepts
+  re_int <- ranef(model)$trial
+  qqnorm(re_int[,"(Intercept)"], 
+         main = "Q-Q Plot of Random Intercepts")
+  qqline(re_int[,"(Intercept)"], col = "red")
+  }
+
+
+# Run diagnostics on final model
+diagnostics(sanity_mod)
+```
+
+### Influential Analysis
+```{r influence}
+# Check for influential trials using Cook's distance and DFBETAS
+influence_analysis <- function(model) {
+  par(mfrow = c(1, 1))
+  
+  tryCatch({
+    # Calculate Cook's distance
+    infl <- influence(model, group = "trial")
+    cook_values <- cooks.distance(infl)
+    
+    # Ensure cook_values has names
+    if(is.null(names(cook_values))) {
+      if(!is.null(rownames(infl$alt.fixed))) {
+        names(cook_values) <- rownames(infl$alt.fixed)
+      } else {
+        names(cook_values) <- paste0("Trial_", 1:length(cook_values))
+      }
+    }
+    
+    print("Cook's Distance by Trial:")
+    print(cook_values)
+    
+    # Calculate Cook's distance threshold
+    cook_threshold <- 4 / length(cook_values)
+    
+    # Plot Cook's distance with trial names
+    plot(1:length(cook_values), cook_values, type = "h", 
+         main = "Cook's Distance by Trial",
+         ylab = "Cook's Distance", xlab = "",
+         lwd = 2, xaxt = "n")  
+    
+    # Add trial names as x-axis labels
+    axis(1, at = 1:length(cook_values), labels = names(cook_values), las = 2)
+    
+    # Add threshold line and legend
+    abline(h = cook_threshold, col = "red", lty = 2, lwd = 2)
+    legend("topright", 
+           legend = paste("Threshold =", round(cook_threshold, 3)),
+           col = "red", lty = 2, lwd = 2,
+           bg = "white")
+    
+    # Mark trials exceeding threshold
+    influential_cook <- which(cook_values > cook_threshold)
+    if (length(influential_cook) > 0) {
+      points(influential_cook, cook_values[influential_cook], 
+             col = "red", pch = 16, cex = 1.5)
+      text(influential_cook, cook_values[influential_cook],
+           labels = names(cook_values)[influential_cook],
+           pos = 3, col = "red", font = 2)
+    }
+    
+    
+    # DFBETAS for treatment effect - check stability of treatment estimate
+    dfb <- dfbetas(infl)
+    if ("treatment01" %in% colnames(dfb)) {
+      dfb_values <- dfb[, "treatment01"]
+      
+      # Ensure dfb_values has names
+      if(is.null(names(dfb_values))) {
+        names(dfb_values) <- names(cook_values)  # Use same names as cook_values
+      }
+      
+      # Calculate DFBETAS threshold
+      dfb_threshold <- 2 / sqrt(nobs(model))
+      
+      # Plot DFBETAS with trial names
+      plot(1:length(dfb_values), dfb_values, type = "h",
+           main = "DFBETAS for Average Treatment Effects",
+           ylab = "DFBETAS", xlab = "",
+           lwd = 2, xaxt = "n")  
+      
+      # Add trial names as x-axis labels
+      axis(1, at = 1:length(dfb_values), labels = names(dfb_values), las = 2)
+      
+      # Add threshold lines and legend
+      abline(h = c(-1, 1) * dfb_threshold, col = "red", lty = 2, lwd = 2)
+      abline(h = 0, col = "gray", lty = 1)
+      legend("topright", 
+             legend = paste("Threshold = ±", round(dfb_threshold, 3)),
+             col = "red", lty = 2, lwd = 2,
+             bg = "white")
+      
+      # Mark trials exceeding threshold
+      influential_dfb <- which(abs(dfb_values) > dfb_threshold)
+      if (length(influential_dfb) > 0) {
+        points(influential_dfb, dfb_values[influential_dfb], 
+               col = "red", pch = 16, cex = 1.5)
+      }
+    }
+    
+  }, error = function(e) {
+    cat("Influence analysis failed:", e$message, "\n")
+  })
+}
+
+# Run influence analysis on sanity model
+influence_analysis(sanity_mod)
+```
+
+
+### Sensitivity Analysis
+```{r sensitivity}
+# Sensitivity analysis: assess robustness by systematically removing each trial
+sensitivity <- function(model, data) {
+  
+  trials <- unique(data$trial)
+  sensitivity_results <- data.frame()
+  
+  # Fit model while removing each trial one at a time
+  for (trial_to_remove in trials) {
+    subset_data <- data %>% filter(trial != trial_to_remove)
+    
+    tryCatch({
+      sens_model <- update(model, data = subset_data)
+      
+      fixed_effects <- fixef(sens_model)
+      if ("treatment01" %in% names(fixed_effects)) {
+        result <- data.frame(
+          Removed_Trial = trial_to_remove,
+          Treatment_Effect = fixed_effects["treatment01"],
+          Tau = as.data.frame(VarCorr(sens_model))[1, "sdcor"]
+        )
+        sensitivity_results <- rbind(sensitivity_results, result)
+      }
+    }, error = function(e) {
+      cat("Model failed when removing trial", trial_to_remove, "\n")
+    })
+  }
+  
+  print(sensitivity_results)
+  
+  # Visualize sensitivity analysis results
+  if (nrow(sensitivity_results) > 0) {
+    p <- ggplot(sensitivity_results, aes(x = Removed_Trial, y = Treatment_Effect)) +
+      geom_point(size = 3) +
+      geom_hline(yintercept = fixef(model)["treatment01"], 
+                 linetype = "dashed", color = "red") +
+      labs(title = "Sensitivity Analysis: Treatment Effect When Removing Each Trial",
+           y = "Treatment Effect", x = "Removed Trial") +
+      theme_minimal()
+    print(p)
+  }
+  
+  return(sensitivity_results)
+}
+
+# Execute sensitivity analysis on final model
+sensitivity_results <- sensitivity(sanity_mod, data_factor_2trt)
+```
+
+### View the summary statistics of sanity model and compare the result of Wald CI and Satterthwaite CI
+```{r summary}
+# Get all coefficients from summary table
+summary_model <- summary(sanity_mod)
+coefficients <- summary_model$coefficients
+
+ate_estimate <- coefficients["treatment01", "Estimate"]
+ate_se <- coefficients["treatment01", "Std. Error"]
+ate_df <- coefficients["treatment01", "df"]
+
+# Wald 95% CI
+wald_ci <- confint(sanity_mod, method = "Wald", level = 0.95)
+ate_wald_lower <- ate_estimate - 1.96 * ate_se
+ate_wald_upper <- ate_estimate + 1.96 * ate_se
+
+cat("\n=== Wald 95% CI ===\n")
+cat(sprintf("ATE: %.3f (95%% CI: [%.3f, %.3f])\n", 
+            ate_estimate, ate_wald_lower, ate_wald_upper))
+
+# Satterthwaite 95% CI
+ci_satt <- data.frame(
+  Estimate = coefficients[, "Estimate"],
+  Lower_CI = coefficients[, "Estimate"] - qt(0.975, df = 3) * coefficients[, "Std. Error"],
+  Upper_CI = coefficients[, "Estimate"] + qt(0.975, df = 3) * coefficients[, "Std. Error"],
+  df = coefficients[, "df"],
+  `Pr(>|t|)` = coefficients[, "Pr(>|t|)"]
+)
+print(ci_satt)
+```
+
+
+### Two-stage model setup; Making forest plot and funnel plot
+```{r two_stage}
+# Two-stage ipdma
+# Stage 1: fit model by trial to get ATE respectively
+two_stage_results <- data_factor_2trt %>%
+  group_by(trial) %>%
+  do({
+    fit <- lm(
+      pasdas_po ~ treatment01 + pasdas_bsl + age + BMI + sex_bin + 
+        disease_duration + smoking_bin,
+      data = .
+    )
+    coef_summary <- summary(fit)$coefficients
+    data.frame(
+      trial = unique(.$trial),
+      ATE = coef_summary["treatment01", "Estimate"],
+      SE = coef_summary["treatment01", "Std. Error"]
+    )
+  })
+
+print(two_stage_results)
+
+# Stage 2: pool results using random-effects meta-analysis
+meta_res <- rma(yi = ATE, sei = SE, data = two_stage_results, method = "REML",test="knha")
+summary(meta_res)
+
+# Weight of each trial
+w <- weights(meta_res)
+w_perc <- 100 * w / sum(w)          
+w_lab  <- sprintf("%.2f", w_perc)           
+
+# Adjust the size of the squares shown in the plot according to weight
+psize_vector <- 0.8 + w / 30
+
+# Add p-value, I^2, and tau^2 estimate info
+mlabfun <- function(text, x) {
+   list(bquote(paste(.(text),
+       " (",
+      .(fmtp2(x$QEp)), ", ",
+      I^2, " = ", .(fmtx(x$I2, digits=1)), "%, ",
+      tau^2, " = ", .(fmtx(x$tau2, digits=2)), ")")))}
+
+pred <- predict(meta_res)
+
+# Forest plot
+forest(meta_res, 
+       header = c("Study", "Mean Difference [95% CI]"),
+       psize = psize_vector,
+       efac = 2,
+       col = "blue",
+       slab = two_stage_results$trial,
+       xlab = "Mean Difference in PASDAS Score (Intensive vs. Standard)",
+       mlab = mlabfun("Two-stage Summary",meta_res),
+       ilab = w_lab, 
+       ilab.lab = "two-stage weight%",
+       ilab.xpos = -2.5,         
+       ylim = c(-3, 6.5),
+       cex = 0.9)               
+
+# Add one-stage result to the plot
+ate_ci_satt <- ci_satt["treatment01", c("Estimate", "Lower_CI", "Upper_CI")]
+addpoly(x = ate_ci_satt$Estimate,
+        ci.lb = ate_ci_satt$Lower_CI,
+        ci.ub = ate_ci_satt$Upper_CI,
+        col = "green",
+        rows = -2,
+        cex = 0.9,
+        mlab = "One-stage Summary") 
+
+# Add a red vertical line across two-stage diamond
+abline(v = meta_res$b,      
+       col = "red",         
+       lty = "dashed",      
+       lwd = 1)             
+
+# Make a funnel plot
+funnel(meta_res, main="Standard Error",  xlab = "Treatment effect (MD)", legend=list(show="cis"))
+```
+
+### Save the result of one stage model for later use
+```{r, echo = TRUE}
+# Save the data since we will use it again in another rmd
+one_stage_vals <- list(
+  ATE      = ate_ci_satt$Estimate,
+  CI_lower = ate_ci_satt$Lower_CI,
+  CI_upper = ate_ci_satt$Upper_CI
+)
+
+dir.create("outputs", showWarnings = FALSE)
+saveRDS(one_stage_vals, file = "outputs/one_stage_ate.rds")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,198 @@
+---
+title: "Propensity Score"
+author: "YJ"
+date: "2025-10-25"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,      
+  eval = FALSE,     
+  results = 'hide', 
+  warning = FALSE,  
+  message = FALSE,  
+  fig.show = 'hide' 
+)
+```
+
+### Packages Loading
+```{r package}
+set.seed(42)
+library(dplyr)
+library(tidyr)
+library(grf)
+library(ggplot2)
+library(patchwork) 
+```
+
+### Data Loading
+```{r data}
+# data loading
+data_factor_2trt <- readRDS( "D://Dissertation Dataset//data_factor_2trt.rds")
+```
+
+
+### Oracle propensity score
+```{r ratio}
+x_vars <- c("pasdas_bsl","age","sex_bin","BMI","disease_duration","smoking_bin", "trial")
+trial_var <- "trial"
+treat_var <- "treatment"
+true_ratio <- c(
+  "COMPLETE"  = 38/(38+39),
+  "GOLMePsA"  = 43/(41+43),
+  "SPEED"     = 112/(49+112),
+  "STAMP"     = 60/(60+60)
+)
+print(true_ratio)
+```
+
+### CATE estimation with estimated propensity score
+```{r estimated}
+# Make a complete dataset
+df_cc <- data_factor_2trt %>%
+  mutate(
+    !!treat_var := as.factor(.data[[treat_var]])
+  ) %>%
+  select(all_of(c(trial_var, treat_var, x_vars, "pasdas_po"))) %>%
+  drop_na()
+
+# Extract outcome variable
+Y <- as.numeric(df_cc$pasdas_po)
+
+# Convert treatment to binary (0/1)
+W_fac <- df_cc[[treat_var]]
+lev <- levels(W_fac)
+cat("Treatment levels:", paste(lev, collapse = ", "), "\n")
+W <- as.integer(W_fac == lev[2])
+
+# Create matrix for covariates
+X_df <- df_cc[, x_vars, drop = FALSE]
+X <- model.matrix(~ . - 1, data = X_df)
+
+# Split data into train/test sets (60/40 split)
+set.seed(42)
+n <- nrow(X)
+train <- sample(n, floor(0.6 * n))
+test <- setdiff(seq_len(n), train)
+
+# Train causal forest with estimated propensity scores
+cate.forest <- causal_forest(X[train, ], Y[train], W[train])
+
+# Predict CATEs on test set
+X.test <- X[test, ]
+tau.hat.test <- predict(cate.forest, X.test)$predictions
+
+# Create evaluation forest on test set
+eval.forest <- causal_forest(X.test, Y[test], W[test])
+```
+
+### CATE estimation with oracle propensity score
+```{r oracle}
+# Extract trial information for complete cases
+trial_cc <- as.factor(df_cc[[trial_var]])
+
+# Assign oracle propensity scores based on known trial allocation ratios
+W_hat_oracle <- as.numeric(true_ratio[trial_cc])
+
+# Train causal forest with oracle propensity scores
+cate.forest.orc <- causal_forest(X[train,], Y[train], W[train], W.hat = W_hat_oracle[train])
+
+# Predict CATEs on test set using oracle method
+tau.hat.test.orc <- predict(cate.forest.orc, X.test)$predictions
+
+# Create evaluation forest with oracle propensity scores
+eval.forest.orc <- causal_forest(X.test, Y[test], W[test], W.hat = W_hat_oracle[test])
+```
+
+
+### Comparison Visualization: estimated vs oracle propensity score
+```{r compare}
+# 1. Histogram Comparison: CATE distributions with unified scales
+# Create unified histogram breaks using both CATE estimates
+brks <- hist(c(tau.hat.test, tau.hat.test.orc), plot = FALSE)$breaks
+
+# Calculate frequencies for unified y-axis scaling
+counts_est <- hist(tau.hat.test, breaks = brks, plot = FALSE)$counts
+counts_orc <- hist(tau.hat.test.orc, breaks = brks, plot = FALSE)$counts
+ymax_hist <- max(counts_est, counts_orc)
+
+# Create histogram for estimated propensity scores
+p_hist_est <- ggplot(data.frame(tau = tau.hat.test),
+                     aes(x = tau, y = after_stat(count))) +
+  geom_histogram(breaks = brks, fill = "grey70", color = "grey30") +
+  scale_y_continuous(limits = c(0, ymax_hist)) +
+  xlab("Estimated CATEs (PASDAS)") + ylab("Frequency") +
+  ggtitle("Histogram (Estimated)") + 
+  theme_classic()
+
+# Create histogram for oracle propensity scores
+p_hist_orc <- ggplot(data.frame(tau = tau.hat.test.orc),
+                     aes(x = tau, y = after_stat(count))) +
+  geom_histogram(breaks = brks, fill = "grey70", color = "grey30") +
+  scale_y_continuous(limits = c(0, ymax_hist)) +
+  xlab("Estimated CATEs (PASDAS)") + ylab("Frequency") +
+  ggtitle("Histogram (Oracle)") + 
+  theme_classic()
+
+
+# 2. ATE by quartiles: Treatment effect heterogeneity comparison
+# Calculate ATE by quartile groups
+ate_by_quartiles <- function(tau_hat, eval_forest, ng = 4) {
+  qfac <- cut(tau_hat,
+              quantile(tau_hat, seq(0, 1, by = 1/ng)),
+              labels = 1:ng, include.lowest = TRUE)
+  idx_list <- split(seq_along(qfac), qfac)
+  out <- lapply(idx_list, function(ix) average_treatment_effect(eval_forest, subset = ix))
+  df <- data.frame(matrix(unlist(out), nrow = ng, byrow = TRUE,
+                          dimnames = list(NULL, c("estimate","std.err"))))
+  df$group <- factor(1:ng, labels = paste0("Q", 1:ng))
+  df
+}
+
+# Calculate ATE by quartiles for both methods
+df_ate_est <- ate_by_quartiles(tau.hat.test, eval.forest, ng = 4)
+df_ate_orc <- ate_by_quartiles(tau.hat.test.orc, eval.forest.orc, ng = 4)
+
+# Calculate unified y-axis range for ATE plots
+rng_est <- with(df_ate_est, c(min(estimate - 1.96*std.err), max(estimate + 1.96*std.err)))
+rng_orc <- with(df_ate_orc, c(min(estimate - 1.96*std.err), max(estimate + 1.96*std.err)))
+ylim_ate <- range(c(rng_est, rng_orc))
+
+# Create ATE plot for estimated propensity scores
+p_ate_est <- ggplot(df_ate_est, aes(x = group, y = estimate)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = estimate - 1.96*std.err, 
+                    ymax = estimate + 1.96*std.err),
+                width = 0.2) +
+  scale_y_continuous(limits = ylim_ate) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlab("CATE Quartile Groups") +
+  ylab("ATE within quartile (PASDAS)") +
+  ggtitle("ATE by CATE quartiles (Estimated)") +
+  theme_classic()
+
+# Create ATE plot for oracle propensity scores
+p_ate_orc <- ggplot(df_ate_orc, aes(x = group, y = estimate)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = estimate - 1.96*std.err, 
+                    ymax = estimate + 1.96*std.err),
+                width = 0.2) +
+  scale_y_continuous(limits = ylim_ate) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlab("CATE Quartile Groups") +
+  ylab("ATE within quartile (PASDAS)") +
+  ggtitle("ATE by CATE quartiles (Oracle)") +
+  theme_classic()
+
+# 3. Create 2x2 comparison plot
+# Combine all four plots into a 2x2 grid
+four_panel <- (p_hist_est + p_hist_orc) / (p_ate_est + p_ate_orc) +
+  plot_annotation(title = "Comparison of Estimated vs Oracle Propensity Scores",
+                  theme = theme(plot.title = element_text(hjust = 0.5, size = 14)))
+print(four_panel)
+```
+
+
